@@ -11,6 +11,12 @@ def init_speculator(
 ):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    if speculative_config.use_parallel():
+        from vllm.v1.worker.gpu.spec_decode.parallel_speculator import (
+            ParallelSpeculator,
+        )
+
+        return ParallelSpeculator(vllm_config, device)
     if speculative_config.use_eagle():
         from vllm.v1.worker.gpu.spec_decode.eagle import EagleSpeculator
 

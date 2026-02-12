@@ -1,0 +1,234 @@
+{
+  "feature": "Parallel Speculative Decoding for vLLM v1",
+  "slug": "vllmparallel-speculative-decoding",
+  "created": "2026-02-11",
+  "phases": [
+    {
+      "id": "phase-1",
+      "name": "Minimal Working Parallel-SD",
+      "description": "Core engine: ReuseCache, ParallelSpeculator, config changes, routing, model runner integration, KV cache, CUDA graphs, metrics",
+      "stories": ["US-1", "US-2", "US-3", "US-4", "US-5", "US-6"]
+    },
+    {
+      "id": "phase-2",
+      "name": "Early Exit + Concurrent Execution",
+      "description": "PyTorch forward hooks for early exit hidden_states extraction and CUDA multi-stream concurrent execution",
+      "stories": ["US-7", "US-8"]
+    },
+    {
+      "id": "phase-3",
+      "name": "Experiment Script + Polish",
+      "description": "Full experiment script with all datasets, TokenChannel stub, comprehensive integration tests",
+      "stories": ["US-9", "US-10", "US-11"]
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-1",
+      "title": "ReuseCache Data Structure",
+      "phase": "phase-1",
+      "files": [
+        {"path": "vllm/v1/spec_decode/reuse_cache.py", "action": "new"},
+        {"path": "tests/v1/spec_decode/test_reuse_cache.py", "action": "new"}
+      ],
+      "acceptance_criteria": [
+        "store_branch() stores entries keyed by tuple of token IDs",
+        "lookup() returns continuation tokens on exact key match, None on miss",
+        "lookup() with half-cache-hit enabled tries prefix match when exact fails (only when top_k=1)",
+        "clear() removes all entries",
+        "get_statistics() returns accurate hit/miss/half_hit counts",
+        "reset_statistics() zeroes all counters",
+        "Unit tests pass: 10+ test cases covering store/lookup/miss/half-hit/clear/stats"
+      ]
+    },
+    {
+      "id": "US-2",
+      "title": "SpeculativeConfig Extensions",
+      "phase": "phase-1",
+      "files": [
+        {"path": "vllm/config/speculative.py", "action": "modify"}
+      ],
+      "acceptance_criteria": [
+        "method='parallel' accepted in config without error",
+        "All 5 new parameters parseable from speculative_config dict",
+        "Smart defaults: eagle when model path provided, mtp when not",
+        "Validation: parallel_enable_half_cache_hit only valid when parallel_top_k == 1",
+        "use_eagle() returns appropriate value based on parallel_draft_method",
+        "Config unit tests pass"
+      ]
+    },
+    {
+      "id": "US-3",
+      "title": "ParallelSpeculator Core",
+      "phase": "phase-1",
+      "files": [
+        {"path": "vllm/v1/worker/gpu/spec_decode/parallel_speculator.py", "action": "new"}
+      ],
+      "acceptance_criteria": [
+        "Wraps EagleSpeculator (delegates load_model(), set_attn(), etc.)",
+        "Computes root_tokens using target model's lm_head on hidden_states",
+        "Generates branches as virtual requests in batched propose() call",
+        "Stores all branches in per-request ReuseCache",
+        "Cache HIT returns cached draft tokens without extra draft model call",
+        "Cache MISS falls back to standard propose()",
+        "PREFILL mode: only branch at last position (branch count = top_k)",
+        "DECODE mode: branch at all positions (branch count = (num_spec + 1) * top_k)",
+        "Pass-through mode works (pure EagleSpeculator behavior)",
+        "Unit tests with mock EagleSpeculator pass"
+      ]
+    },
+    {
+      "id": "US-4",
+      "title": "Routing and Model Runner Integration",
+      "phase": "phase-1",
+      "files": [
+        {"path": "vllm/v1/worker/gpu/spec_decode/__init__.py", "action": "modify"},
+        {"path": "vllm/v1/worker/gpu/model_runner.py", "action": "modify"}
+      ],
+      "acceptance_criteria": [
+        "init_speculator() returns ParallelSpeculator when method='parallel'",
+        "Model runner extracts full hidden_states tensor during target model forward",
+        "all_hidden_states passed to propose() as optional parameter",
+        "Non-parallel methods unaffected (backward-compatible)",
+        "Integration test: ParallelSpeculator loads and runs with real Eagle model"
+      ]
+    },
+    {
+      "id": "US-5",
+      "title": "KV Cache and CUDA Graph Support",
+      "phase": "phase-1",
+      "files": [
+        {"path": "vllm/v1/worker/gpu/spec_decode/parallel_speculator.py", "action": "modify"}
+      ],
+      "acceptance_criteria": [
+        "Each request pre-allocates KV cache slots for max_branches at request start",
+        "KV slots released when request completes",
+        "CUDA graphs captured with padded max batch size",
+        "Branch virtual requests use pre-allocated KV slots",
+        "Fresh KV cache each propose() round"
+      ]
+    },
+    {
+      "id": "US-6",
+      "title": "Metrics and Observability",
+      "phase": "phase-1",
+      "files": [
+        {"path": "vllm/v1/worker/gpu/spec_decode/parallel_speculator.py", "action": "modify"},
+        {"path": "vllm/v1/spec_decode/reuse_cache.py", "action": "modify"}
+      ],
+      "acceptance_criteria": [
+        "HIT/MISS/HALF-HIT counts tracked per request",
+        "Global aggregation across all requests",
+        "Cache operation latency logged at DEBUG level",
+        "get_cache_statistics() returns structured metrics dict",
+        "Pass-through mode disables all Parallel-SD logic",
+        "Metrics visible in experiment script output"
+      ]
+    },
+    {
+      "id": "US-7",
+      "title": "Early Exit Implementation",
+      "phase": "phase-2",
+      "files": [
+        {"path": "vllm/v1/worker/gpu/spec_decode/parallel_speculator.py", "action": "modify"},
+        {"path": "vllm/v1/worker/gpu/model_runner.py", "action": "modify"}
+      ],
+      "acceptance_criteria": [
+        "Forward hook registered on model.model.layers[early_exit_layer]",
+        "Hook captures intermediate hidden_states during target model forward",
+        "parallel_early_exit_layer=-1 uses last layer (default)",
+        "Negative indices supported (relative to last layer)",
+        "Works with LLaMA, DeepSeek, and Pangu model architectures",
+        "Fallback layer name mappings for non-standard models"
+      ]
+    },
+    {
+      "id": "US-8",
+      "title": "Concurrent Execution",
+      "phase": "phase-2",
+      "files": [
+        {"path": "vllm/v1/worker/gpu/spec_decode/parallel_speculator.py", "action": "modify"}
+      ],
+      "acceptance_criteria": [
+        "parallel_enable_concurrent=True enables multi-stream execution",
+        "Draft model branch generation runs on separate CUDA stream",
+        "Target model continues on default stream after early exit point",
+        "Synchronization barrier before cache lookup",
+        "Disabled by default (sequential execution)",
+        "No correctness difference between concurrent and sequential modes"
+      ]
+    },
+    {
+      "id": "US-9",
+      "title": "Experiment Script",
+      "phase": "phase-3",
+      "files": [
+        {"path": "examples/parallel_spec_decode_experiment.py", "action": "new"}
+      ],
+      "acceptance_criteria": [
+        "Script at examples/parallel_spec_decode_experiment.py",
+        "Supports datasets: gpqa_diamond, gpqa_diamond_orig, gsm8k, humaneval, mmlu, mt_bench, custom, local",
+        "Local dataset support: JSON, JSONL, CSV, Parquet, directories",
+        "--compare-eagle flag for Eagle baseline comparison",
+        "--compare-mtp flag for MTP baseline comparison",
+        "--top-k accepts list of values to test",
+        "--save-results outputs structured JSON",
+        "Reports: cache HIT/MISS rates, throughput, acceptance rates",
+        "All CLI arguments as specified in CLAUDE.md"
+      ]
+    },
+    {
+      "id": "US-10",
+      "title": "TokenChannel Stub",
+      "phase": "phase-3",
+      "files": [
+        {"path": "vllm/v1/spec_decode/token_channel.py", "action": "new"}
+      ],
+      "acceptance_criteria": [
+        "File at vllm/v1/spec_decode/token_channel.py",
+        "All 4 methods defined with NotImplementedError",
+        "Docstrings document intended usage and communication complexity",
+        "No actual communication implementation"
+      ]
+    },
+    {
+      "id": "US-11",
+      "title": "Integration Tests",
+      "phase": "phase-3",
+      "files": [
+        {"path": "tests/v1/spec_decode/test_parallel_integration.py", "action": "new"}
+      ],
+      "acceptance_criteria": [
+        "Token-exact match: Parallel-SD with top_k=1 produces identical output to standard Eagle",
+        "Statistical: Parallel-SD with top_k>1 achieves HIT rate > 0 on test prompts",
+        "PREFILL/DECODE mode transitions work correctly",
+        "Half-cache-hit produces valid (non-error) output",
+        "Multi-request batch works correctly",
+        "Cache statistics are accurate (counts match actual hits/misses)",
+        "Test with both Eagle and MTP underlying methods"
+      ]
+    }
+  ],
+  "config": {
+    "method": "parallel",
+    "parameters": [
+      {"name": "parallel_draft_method", "type": "str", "default": "eagle", "description": "Underlying draft method: eagle, eagle3, or mtp"},
+      {"name": "parallel_top_k", "type": "int", "default": 1, "description": "Top-κ candidates per position"},
+      {"name": "parallel_enable_half_cache_hit", "type": "bool", "default": false, "description": "Enable prefix matching (only when top_k=1)"},
+      {"name": "parallel_early_exit_layer", "type": "int", "default": -1, "description": "Early exit layer index (-1 = last layer)"},
+      {"name": "parallel_enable_concurrent", "type": "bool", "default": false, "description": "Enable concurrent draft+target execution"}
+    ]
+  },
+  "architecture_decisions": {
+    "wrap_level": "Speculator level (ParallelSpeculator wraps EagleSpeculator)",
+    "branch_generation": "Batched forward pass with virtual requests",
+    "kv_cache": "Virtual requests with per-request pre-allocation, fresh each round",
+    "hidden_states": "Full tensor from target model, passed via extended propose() args",
+    "root_tokens": "Target model's own lm_head on hidden_states",
+    "cuda_graphs": "Pad to max batch size for static shapes",
+    "cache_scope": "Per-request ReuseCache",
+    "error_handling": "Propagate up and interrupt",
+    "early_exit": "PyTorch forward hooks (model-agnostic)",
+    "concurrent": "Single-GPU CUDA multi-stream (configurable)"
+  }
+}

@@ -65,6 +65,8 @@ class EagleProposer:
         assert self.speculative_config is not None
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
+        if self.method == "parallel":
+            self.method = self.speculative_config.parallel_draft_method
 
         self.runner = runner
         self.device = device

@@ -8,10 +8,12 @@ def start_vllm():
 
     served_model_name = "pangu"
     spec_cfg = {
-        "method": "mtp",
+        "method": "parallel",
         "model": spec_model_path,
         "num_speculative_tokens": 1,
         "draft_tensor_parallel_size": 1,
+        "parallel_draft_method": "mtp",
+        "parallel_top_k": 1,
     }
 
     command = [

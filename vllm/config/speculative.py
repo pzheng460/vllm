@@ -47,6 +47,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "suffix",
+    "parallel",
     EagleModelTypes,
 ]
 
@@ -148,6 +149,26 @@ class SpeculativeConfig:
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
 
+    # Parallel Speculative Decoding configuration
+    parallel_draft_method: str | None = None
+    """Underlying draft method for parallel speculative decoding.
+    One of 'eagle', 'eagle3', or 'mtp'. When method='parallel' and this
+    is not set, defaults to 'eagle' if model path is provided, otherwise
+    'mtp'."""
+    parallel_top_k: int = 1
+    """Top-k candidates per position for branch generation in parallel
+    speculative decoding."""
+    parallel_enable_half_cache_hit: bool = False
+    """Enable prefix matching fallback in the reuse cache. Only effective
+    when parallel_top_k == 1."""
+    parallel_early_exit_layer: int = -1
+    """Early exit layer index for extracting intermediate hidden states.
+    Negative values are relative to the last layer (-1 = last layer,
+    i.e., no early exit)."""
+    parallel_enable_concurrent: bool = False
+    """Enable concurrent execution of draft model on a separate CUDA
+    stream while the target model continues processing."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -164,6 +185,11 @@ class SpeculativeConfig:
         # Eagle3 affects the computation graph because it returns intermediate
         # hidden states in addition to the final hidden state.
         factors.append(self.method == "eagle3")
+        # Parallel-SD with eagle3 also needs intermediate hidden states
+        factors.append(
+            self.method == "parallel"
+            and self.parallel_draft_method == "eagle3"
+        )
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -258,6 +284,11 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
+
+        # Handle parallel speculative decoding
+        if self.method == "parallel":
+            self._configure_parallel()
+            return self
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
@@ -476,6 +507,168 @@ class SpeculativeConfig:
                 )
         return self
 
+    def _configure_parallel(self):
+        """Configure parallel speculative decoding parameters."""
+        # Smart defaults for parallel_draft_method
+        if self.parallel_draft_method is None:
+            if self.model is not None:
+                self.parallel_draft_method = "eagle"
+            else:
+                self.parallel_draft_method = "mtp"
+
+        # Validate parallel_enable_half_cache_hit
+        if self.parallel_enable_half_cache_hit and self.parallel_top_k != 1:
+            raise ValueError(
+                "parallel_enable_half_cache_hit is only valid when "
+                f"parallel_top_k == 1, got parallel_top_k="
+                f"{self.parallel_top_k}"
+            )
+
+        # For MTP without explicit model, use target model
+        if self.parallel_draft_method == "mtp" and self.model is None:
+            if self.target_model_config is None:
+                raise ValueError(
+                    "target_model_config must be present for parallel+mtp"
+                )
+            self.model = self.target_model_config.model
+            if not self.quantization:
+                self.quantization = self.target_model_config.quantization
+
+        if self.model is None:
+            raise ValueError(
+                "model must be specified for parallel speculative decoding "
+                "with eagle/eagle3 draft method."
+            )
+
+        # Build the draft model config using the underlying draft method
+        # Temporarily set method to the underlying draft method for config
+        original_method = self.method
+        self.method = self.parallel_draft_method
+
+        # Reuse the standard draft model config initialization
+        self.draft_model_config = ModelConfig(
+            model=self.model,
+            runner="draft",
+            tokenizer=self.target_model_config.tokenizer,
+            tokenizer_mode=self.target_model_config.tokenizer_mode,
+            trust_remote_code=self.target_model_config.trust_remote_code,
+            allowed_local_media_path=(
+                self.target_model_config.allowed_local_media_path),
+            allowed_media_domains=(
+                self.target_model_config.allowed_media_domains),
+            dtype=self.target_model_config.dtype,
+            seed=self.target_model_config.seed,
+            revision=self.revision,
+            code_revision=self.code_revision,
+            tokenizer_revision=self.target_model_config.tokenizer_revision,
+            spec_target_max_model_len=(
+                self.target_model_config.max_model_len),
+            quantization=self.quantization,
+            enforce_eager=self.target_model_config.enforce_eager,
+            max_logprobs=self.target_model_config.max_logprobs,
+            hf_overrides=SpeculativeConfig.hf_config_override,
+            config_format=self.target_model_config.config_format,
+        )
+
+        # Auto-detect underlying method if not explicitly eagle/eagle3/mtp
+        if self.parallel_draft_method in ("eagle", "eagle3"):
+            pass
+        elif self.parallel_draft_method == "mtp":
+            pass
+        elif "eagle-" in self.draft_model_config.model.lower():
+            self.parallel_draft_method = "eagle"
+        elif "eagle3" in self.draft_model_config.model.lower():
+            self.parallel_draft_method = "eagle3"
+        elif self.draft_model_config.hf_config.model_type in get_args(
+            MTPModelTypes
+        ):
+            self.parallel_draft_method = "mtp"
+
+        # Handle EAGLE config wrapping
+        if self.parallel_draft_method in ("eagle", "eagle3"):
+            from vllm.transformers_utils.configs import SpeculatorsConfig
+            from vllm.transformers_utils.configs.eagle import EAGLEConfig
+
+            if not isinstance(
+                self.draft_model_config.hf_config,
+                (EAGLEConfig, SpeculatorsConfig),
+            ):
+                eagle_config = EAGLEConfig(
+                    self.draft_model_config.hf_config,
+                    method=self.parallel_draft_method,
+                    model_type="eagle",
+                )
+                self.draft_model_config.hf_config = eagle_config
+                self.draft_model_config.model_arch_config = (
+                    self.draft_model_config.get_model_arch_config()
+                )
+
+        # Handle n_predict / num_speculative_tokens
+        n_predict = getattr(
+            self.draft_model_config.hf_config, "n_predict", None
+        )
+        if n_predict is not None:
+            if self.num_speculative_tokens is None:
+                self.num_speculative_tokens = n_predict
+            elif (
+                self.num_speculative_tokens > n_predict
+                and self.num_speculative_tokens % n_predict != 0
+            ):
+                raise ValueError(
+                    f"num_speculative_tokens:{self.num_speculative_tokens}"
+                    f" must be divisible by {n_predict=}"
+                )
+
+        # Generate speculative token tree
+        if self.speculative_token_tree is None:
+            self.speculative_token_tree = str(
+                [(i + 1) * (0,)
+                 for i in range(self.num_speculative_tokens)]
+            )
+        else:
+            tree_choices = ast.literal_eval(self.speculative_token_tree)
+            self.speculative_token_tree = str(
+                sorted(tree_choices, key=lambda t: (len(t), t))
+            )
+
+        # Configure draft TP and parallel
+        self.draft_tensor_parallel_size = (
+            SpeculativeConfig._verify_and_get_draft_tp(
+                self.target_parallel_config,
+                self.draft_tensor_parallel_size,
+                self.draft_model_config.hf_config,
+            )
+        )
+
+        self.draft_model_config.max_model_len = (
+            SpeculativeConfig._maybe_override_draft_max_model_len(
+                self.max_model_len,
+                self.draft_model_config.max_model_len,
+                self.target_model_config.max_model_len,
+            )
+        )
+
+        self.draft_parallel_config = (
+            SpeculativeConfig.create_draft_parallel_config(
+                self.target_parallel_config,
+                self.draft_tensor_parallel_size,
+            )
+        )
+
+        # Restore original method
+        self.method = original_method
+
+        logger.info(
+            "Parallel speculative decoding configured: "
+            "draft_method=%s, top_k=%d, half_cache_hit=%s, "
+            "early_exit_layer=%d, concurrent=%s",
+            self.parallel_draft_method,
+            self.parallel_top_k,
+            self.parallel_enable_half_cache_hit,
+            self.parallel_early_exit_layer,
+            self.parallel_enable_concurrent,
+        )
+
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
             raise ImportError(
@@ -650,10 +843,20 @@ class SpeculativeConfig:
         return self
 
     def use_eagle(self) -> bool:
+        if self.method == "parallel":
+            return self.parallel_draft_method in ("eagle", "eagle3", "mtp")
         return self.method in ("eagle", "eagle3", "mtp")
+
+    def use_parallel(self) -> bool:
+        return self.method == "parallel"
 
     def __repr__(self) -> str:
         method = self.method
         model = None if method in ("ngram", "suffix") else self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
+        if method == "parallel":
+            draft_method = self.parallel_draft_method
+            top_k = self.parallel_top_k
+            return (f"SpeculativeConfig({method=}, {draft_method=}, "
+                    f"{model=}, {num_spec_tokens=}, {top_k=})")
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

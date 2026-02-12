@@ -1,0 +1,18 @@
+# Parallel Speculative Decoding - Implementation Progress
+
+## Phase 1: Minimal Working Parallel-SD
+- [DONE] US-1: ReuseCache Data Structure
+- [DONE] US-2: SpeculativeConfig Extensions
+- [DONE] US-3: ParallelSpeculator Core
+- [DONE] US-4: Routing and Model Runner Integration
+- [DONE] US-5: KV Cache and CUDA Graph Support
+- [DONE] US-6: Metrics and Observability
+
+## Phase 2: Early Exit + Concurrent Execution
+- [DONE] US-7: Early Exit Implementation
+- [DONE] US-8: Concurrent Execution
+
+## Phase 3: Experiment Script + Polish
+- [DONE] US-9: Experiment Script
+- [DONE] US-10: TokenChannel Stub
+- [DONE] US-11: Integration Tests

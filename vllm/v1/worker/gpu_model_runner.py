@@ -439,6 +439,12 @@ class GPUModelRunner(
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.use_parallel():
+                from vllm.v1.spec_decode.parallel_proposer import (
+                    ParallelProposer,
+                )
+                self.drafter = ParallelProposer(
+                    self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -848,6 +854,11 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # Clean up per-request Parallel-SD caches
+            if hasattr(self, 'drafter') and hasattr(
+                self.drafter, 'remove_request_cache'
+            ):
+                self.drafter.remove_request_cache(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -3443,7 +3454,10 @@ class GPUModelRunner(
             if spec_config.use_eagle() and not spec_config.disable_padded_drafter_batch:
                 # EAGLE speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer)
+                assert isinstance(self.drafter, EagleProposer) or (
+                    hasattr(self.drafter, '_underlying')
+                    and isinstance(self.drafter._underlying, EagleProposer)
+                )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -3677,7 +3691,14 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
         elif spec_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            # Pass sampled_token_ids for Parallel-SD cache lookup
+            if spec_config.use_parallel() and hasattr(
+                self.drafter, 'set_sampled_token_ids'
+            ):
+                self.drafter.set_sampled_token_ids(
+                    sampled_token_ids,
+                    self.input_batch.req_ids[:],
+                )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4472,7 +4493,10 @@ class GPUModelRunner(
                 hidden_states = outputs
 
             if self.speculative_config and self.speculative_config.use_eagle():
-                assert isinstance(self.drafter, EagleProposer)
+                assert isinstance(self.drafter, EagleProposer) or (
+                    hasattr(self.drafter, '_underlying')
+                    and isinstance(self.drafter._underlying, EagleProposer)
+                )
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
                 # NOTE(lucas): this is a hack, need to clean up.
@@ -5649,7 +5673,10 @@ class GPUModelRunner(
         )
 
         if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, EagleProposer) or (
+                    hasattr(self.drafter, '_underlying')
+                    and isinstance(self.drafter._underlying, EagleProposer)
+                )
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)

@@ -392,8 +392,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if scheduler_output.preempted_req_ids is not None:
             for req_id in scheduler_output.preempted_req_ids:
                 self.req_states.remove_request(req_id)
+                if self.speculator is not None and hasattr(
+                    self.speculator, 'remove_request_cache'
+                ):
+                    self.speculator.remove_request_cache(req_id)
         for req_id in scheduler_output.finished_req_ids:
             self.req_states.remove_request(req_id)
+            if self.speculator is not None and hasattr(
+                self.speculator, 'remove_request_cache'
+            ):
+                self.speculator.remove_request_cache(req_id)
 
         # Add new requests.
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -791,6 +799,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         aux_hidden_states: list[torch.Tensor] | None,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
+        sampled_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.speculator is not None
         last_sampled_tokens = self.req_states.last_sampled_tokens[
@@ -799,6 +808,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         next_prefill_tokens = self.req_states.next_prefill_tokens[
             input_batch.idx_mapping
         ]
+
+        # For ParallelSpeculator, pass all_hidden_states and sampled_token_ids
+        kwargs: dict = {}
+        if hasattr(self.speculator, 'set_passthrough'):
+            # This is a ParallelSpeculator - pass extra context
+            kwargs['all_hidden_states'] = last_hidden_states
+            kwargs['sampled_token_ids'] = sampled_token_ids
+
         draft_tokens = self.speculator.propose(
             input_batch,
             sampling_metadata,
@@ -808,6 +825,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_rejected,
             last_sampled_tokens,
             next_prefill_tokens,
+            **kwargs,
         )
         return draft_tokens
 
@@ -997,6 +1015,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 None,  # aux_hidden_states
                 num_sampled,
                 num_rejected,
+                sampled_token_ids=sampler_output.sampled_token_ids,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
