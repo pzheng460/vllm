@@ -31,11 +31,12 @@ class ParallelSpeculator:
 
     Wraps an EagleSpeculator with a Reuse Cache mechanism. On each
     propose() call:
-    1. Generates branches from target model hidden_states
-    2. Stores all branches in the per-request ReuseCache
-    3. Looks up cache with sampled_token_ids
-    4. Cache HIT: returns cached draft tokens
-    5. Cache MISS: falls back to standard propose()
+    1. (Phase 4) Generates branches from target model hidden_states
+       and stores all branches in the per-request ReuseCache
+    2. (Phase 1) Looks up cache with sampled_token_ids
+    3. (Phase 2) Runs standard eagle propose as fallback
+    4. (Phase 3) Cache HIT: merges cached draft tokens into result
+       Cache MISS: returns fallback result as-is
     """
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -97,9 +98,14 @@ class ParallelSpeculator:
 
     def load_model(self, target_model: nn.Module) -> None:
         self._underlying.load_model(target_model)
-        # Save reference to target model's lm_head for root token computation
-        if hasattr(target_model, "lm_head"):
-            self._target_lm_head = target_model.lm_head
+        # After load_model, the draft model shares lm_head with target,
+        # so we can use self._underlying.model.compute_logits() for
+        # root token computation.
+        if hasattr(self._underlying.model, "compute_logits"):
+            self._target_lm_head = True  # Flag: compute_logits available
+            logger.info(
+                "ParallelSpeculator: compute_logits available for root tokens"
+            )
 
         # Set up early exit forward hook if needed
         if self.early_exit_layer != -1:
@@ -373,7 +379,11 @@ class ParallelSpeculator:
         top_k: int,
     ) -> torch.Tensor:
         """Compute root tokens (dummy_sampled_token_ids) using
-        target model's lm_head on hidden_states at specified positions.
+        the draft model's compute_logits on hidden_states at specified
+        positions.
+
+        The draft model shares lm_head weights with the target model,
+        so compute_logits produces target-equivalent logits.
 
         Args:
             hidden_states: Full hidden_states tensor from target model.
@@ -386,7 +396,7 @@ class ParallelSpeculator:
         """
         if self._target_lm_head is None:
             raise RuntimeError(
-                "Target model lm_head not available. "
+                "compute_logits not available on draft model. "
                 "Ensure load_model() was called."
             )
 
@@ -400,9 +410,12 @@ class ParallelSpeculator:
         # Extract hidden_states at specified positions
         selected_hs = hidden_states[pos_tensor]  # [num_pos, hidden_size]
 
-        # Compute logits using target model's lm_head
+        # Compute logits using draft model's compute_logits
+        # (shares lm_head weights with target model)
         with torch.no_grad():
-            logits = self._target_lm_head(selected_hs)  # [num_pos, vocab]
+            logits = self._underlying.model.compute_logits(
+                selected_hs
+            )  # [num_pos, vocab]
 
         # Get top-k token IDs
         _, top_k_ids = torch.topk(logits, k=top_k, dim=-1)  # [num_pos, k]
@@ -624,9 +637,8 @@ class ParallelSpeculator:
         """Generate draft tokens with Parallel-SD cache mechanism.
 
         Implements a 4-phase algorithm:
-          Phase 1: Look up sampled_token_ids in previous round's cache
-          Phase 4: Generate branches for next round (runs before fallback
-                   so fallback leaves correct eagle KV cache state)
+          Phase 4: Generate branches for current round (populate cache)
+          Phase 1: Look up sampled_token_ids in current round's cache
           Phase 2: Standard eagle propose as fallback
           Phase 3: Merge cache hits into fallback result
 
@@ -669,7 +681,31 @@ class ParallelSpeculator:
         num_reqs = input_batch.num_reqs
 
         # --------------------------------------------------------------
-        # Phase 1: Cache Lookup (from previous round's cache)
+        # Phase 4: Generate branches for CURRENT round
+        # (Must run first so cache is populated before lookup)
+        # Uses early exit hidden states (if configured) for root token
+        # computation; fallback propose still uses last_hidden_states.
+        # --------------------------------------------------------------
+        early_hs = self.get_early_exit_hidden_states()
+        branch_hs = early_hs if early_hs is not None else all_hidden_states
+
+        self._generate_branches_for_next_round(
+            input_batch=input_batch,
+            sampling_metadata=sampling_metadata,
+            last_hidden_states=last_hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            all_hidden_states=branch_hs,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            last_sampled=last_sampled,
+            next_prefill_tokens=next_prefill_tokens,
+            sampled_token_ids=sampled_token_ids,
+        )
+
+        # --------------------------------------------------------------
+        # Phase 1: Cache Lookup (in the CURRENT round's cache)
+        # Now that branches are generated and stored, lookup by
+        # sampled_token_ids finds matching branches from this round.
         # --------------------------------------------------------------
         cache_hits: dict[int, list[int]] = {}
         if sampled_token_ids is not None:
@@ -679,37 +715,22 @@ class ParallelSpeculator:
                 if cache is None:
                     continue
 
-                # Extract lookup key from sampled_token_ids
+                # Extract lookup key from sampled_token_ids.
+                # Use num_sampled to determine valid token count because
+                # rejection_sample() uses torch.empty — positions beyond
+                # num_sampled contain uninitialized garbage, not -1.
+                n = int(num_sampled[i].item())
+                if n <= 0:
+                    continue
+
                 if sampled_token_ids.dim() == 1:
                     tokens = [sampled_token_ids[i].item()]
                 else:
-                    tokens = sampled_token_ids[i].tolist()
+                    tokens = sampled_token_ids[i, :n].tolist()
 
-                # Filter out -1 (rejected/padding positions)
-                filtered = [t for t in tokens if t != -1]
-                if not filtered:
-                    continue
-
-                hit = cache.lookup(filtered)
+                hit = cache.lookup(tokens)
                 if hit is not None and len(hit) > 0:
                     cache_hits[i] = hit
-
-        # --------------------------------------------------------------
-        # Phase 4: Generate branches for NEXT round
-        # (Run before fallback so fallback's KV cache writes persist)
-        # --------------------------------------------------------------
-        self._generate_branches_for_next_round(
-            input_batch=input_batch,
-            sampling_metadata=sampling_metadata,
-            last_hidden_states=last_hidden_states,
-            aux_hidden_states=aux_hidden_states,
-            all_hidden_states=all_hidden_states,
-            num_sampled=num_sampled,
-            num_rejected=num_rejected,
-            last_sampled=last_sampled,
-            next_prefill_tokens=next_prefill_tokens,
-            sampled_token_ids=sampled_token_ids,
-        )
 
         # --------------------------------------------------------------
         # Phase 2: Fallback — standard eagle propose

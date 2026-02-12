@@ -30,11 +30,18 @@ class ParallelProposer:
 
     Wraps an EagleProposer with a Reuse Cache mechanism. On each
     propose() call:
-    1. Looks up sampled_token_ids in previous round's cache (Phase 1)
-    2. Generates branches for NEXT round's cache (Phase 4)
-    3. Runs standard fallback propose (Phase 2)
-    4. Merges cache hits into fallback result (Phase 3)
+    1. (Phase 4) Generates branches and stores in current round's cache
+    2. (Phase 1) Looks up sampled_token_ids in current round's cache
+    3. (Phase 2) Runs standard fallback propose
+    4. (Phase 3) Merges cache hits into fallback result
     """
+
+    # Standard layer accessor patterns for common model architectures
+    _LAYER_ACCESSOR_PATTERNS = [
+        "model.layers",        # LLaMA, DeepSeek, Pangu, most HF models
+        "transformer.layers",  # Some GPT-style models
+        "encoder.layers",      # Encoder models
+    ]
 
     def __init__(
         self,
@@ -51,12 +58,19 @@ class ParallelProposer:
         self._num_speculative_tokens = spec_config.num_speculative_tokens
         self.top_k = spec_config.parallel_top_k
         self.enable_half_cache_hit = spec_config.parallel_enable_half_cache_hit
+        self.early_exit_layer = spec_config.parallel_early_exit_layer
 
         # Per-request reuse caches: request_id -> ReuseCache
         self._reuse_caches: dict[str, ReuseCache] = {}
 
         # Target model's lm_head for root token computation
         self._target_lm_head: nn.Module | None = None
+
+        # Early exit support
+        self._early_exit_hook_handle = None
+        self._total_propose_calls = 0
+        self._total_cache_hits = 0
+        self._early_exit_hidden_states: torch.Tensor | None = None
 
         # State for current propose call (set before propose, cleared after)
         self._sampled_token_ids: torch.Tensor | list | None = None
@@ -69,14 +83,107 @@ class ParallelProposer:
 
         logger.info(
             "ParallelProposer initialized: top_k=%d, "
-            "half_cache_hit=%s, num_spec_tokens=%d",
+            "half_cache_hit=%s, num_spec_tokens=%d, "
+            "early_exit_layer=%d",
             self.top_k, self.enable_half_cache_hit,
-            self._num_speculative_tokens,
+            self._num_speculative_tokens, self.early_exit_layer,
         )
 
     def __getattr__(self, name):
         """Delegate attribute access to the underlying EagleProposer."""
         return getattr(self._underlying, name)
+
+    # ------------------------------------------------------------------
+    # Early Exit Support
+    # ------------------------------------------------------------------
+
+    def _find_model_layers(
+        self, target_model: nn.Module,
+    ) -> nn.ModuleList | None:
+        """Find transformer layers in the target model.
+
+        Tries standard naming conventions for layer access.
+
+        Returns:
+            ModuleList of transformer layers, or None if not found.
+        """
+        for pattern in self._LAYER_ACCESSOR_PATTERNS:
+            obj = target_model
+            try:
+                for attr in pattern.split("."):
+                    obj = getattr(obj, attr)
+                if isinstance(obj, (nn.ModuleList, list)):
+                    return obj
+            except AttributeError:
+                continue
+        return None
+
+    def _setup_early_exit_hook(self, target_model: nn.Module) -> None:
+        """Register a forward hook on the early exit layer.
+
+        The hook captures intermediate hidden_states during the target
+        model's forward pass. Supports negative indexing relative to
+        the last layer.
+
+        Args:
+            target_model: The target model to hook into.
+        """
+        layers = self._find_model_layers(target_model)
+        if layers is None:
+            logger.warning(
+                "Could not find transformer layers in target model. "
+                "Early exit disabled."
+            )
+            self.early_exit_layer = -1
+            return
+
+        num_layers = len(layers)
+        # Resolve negative index
+        if self.early_exit_layer < 0:
+            layer_idx = num_layers + self.early_exit_layer
+        else:
+            layer_idx = self.early_exit_layer
+
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(
+                f"early_exit_layer={self.early_exit_layer} is out of range "
+                f"for model with {num_layers} layers. "
+                f"Resolved index: {layer_idx}"
+            )
+
+        target_layer = layers[layer_idx]
+
+        def early_exit_hook(module, input, output):
+            # Output from transformer layer is typically
+            # (hidden_states,) or hidden_states
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+            self._early_exit_hidden_states = hidden_states.detach()
+
+        # Remove previous hook if exists
+        if self._early_exit_hook_handle is not None:
+            self._early_exit_hook_handle.remove()
+
+        self._early_exit_hook_handle = target_layer.register_forward_hook(
+            early_exit_hook
+        )
+        logger.info(
+            "Early exit hook registered on layer %d/%d",
+            layer_idx, num_layers,
+        )
+
+    def get_early_exit_hidden_states(self) -> torch.Tensor | None:
+        """Get the hidden_states captured by the early exit hook.
+
+        Returns:
+            Hidden states tensor if captured, None otherwise.
+            Consumes the captured states (one-time read).
+        """
+        hs = self._early_exit_hidden_states
+        self._early_exit_hidden_states = None  # Consume
+        return hs
 
     # ------------------------------------------------------------------
     # Overridden methods
@@ -93,6 +200,10 @@ class ParallelProposer:
                 "ParallelProposer: compute_logits available for root tokens"
             )
 
+        # Set up early exit forward hook if needed
+        if self.early_exit_layer != -1:
+            self._setup_early_exit_hook(target_model)
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
@@ -108,9 +219,8 @@ class ParallelProposer:
         """Generate draft tokens with Parallel-SD cache mechanism.
 
         Implements a 4-phase algorithm:
-          Phase 1: Look up sampled_token_ids in previous round's cache
-          Phase 4: Generate branches for next round (runs before fallback
-                   so fallback leaves correct KV cache state)
+          Phase 4: Generate branches for current round (populate cache)
+          Phase 1: Look up sampled_token_ids in current round's cache
           Phase 2: Standard propose as fallback
           Phase 3: Merge cache hits into fallback result
         """
@@ -122,26 +232,32 @@ class ParallelProposer:
         else:
             effective_lti = last_token_indices
 
-        # Phase 1: Cache Lookup
-        cache_hits = self._cache_lookup(batch_size)
+        # Get early exit hidden states (if available) for branch generation
+        early_exit_hs = self.get_early_exit_hidden_states()
+        branch_hs = (early_exit_hs
+                     if early_exit_hs is not None
+                     else target_hidden_states)
 
-        # Phase 4: Branch Generation for NEXT round
-        # NOTE: Branch generation requires calling propose() multiple times,
-        # which corrupts the attention metadata builder's internal state.
-        # For num_speculative_tokens == 1, branch generation doesn't help
-        # anyway (each branch produces only 1 deterministic token at temp=0).
-        # Skip branch generation until multi-call propose() is supported.
-        if self._num_speculative_tokens > 1:
-            try:
-                self._generate_branches(
-                    target_token_ids, target_positions,
-                    target_hidden_states,
-                    next_token_ids, effective_lti, common_attn_metadata,
-                    sampling_metadata, mm_embed_inputs,
-                    num_rejected_tokens_gpu, batch_size,
-                )
-            except RuntimeError as e:
-                logger.debug("Branch generation skipped: %s", e)
+        # Phase 4: Branch Generation for CURRENT round
+        # Must run first so cache is populated before lookup.
+        # Uses early exit hidden states (if configured) for root token
+        # computation, but fallback propose still uses target_hidden_states
+        # (draft model needs last-layer HS).
+        try:
+            self._generate_branches(
+                target_token_ids, target_positions,
+                branch_hs, target_hidden_states,
+                next_token_ids, effective_lti, common_attn_metadata,
+                sampling_metadata, mm_embed_inputs,
+                num_rejected_tokens_gpu, batch_size,
+            )
+        except RuntimeError as e:
+            logger.debug("Branch generation skipped: %s", e)
+
+        # Phase 1: Cache Lookup (in CURRENT round's cache)
+        # Now that branches are generated and stored, lookup by
+        # sampled_token_ids finds matching branches from this round.
+        cache_hits = self._cache_lookup(batch_size)
 
         # Phase 2: Fallback (standard propose)
         fallback = self._underlying.propose(
@@ -156,11 +272,31 @@ class ParallelProposer:
             for t in range(n):
                 fallback[req_idx, t] = cached_tokens[t]
 
-        if cache_hits:
-            logger.debug(
-                "Cache hits merged: %d/%d requests",
-                len(cache_hits), batch_size,
+        # Track cache hit statistics
+        self._total_propose_calls += batch_size
+        self._total_cache_hits += len(cache_hits)
+        if self._total_propose_calls % 20 == 0 and self._total_propose_calls > 0:
+            hit_rate = (self._total_cache_hits / self._total_propose_calls
+                        * 100)
+            logger.warning(
+                "Parallel-SD cache stats: %d/%d hits (%.1f%%), "
+                "early_exit_layer=%d",
+                self._total_cache_hits, self._total_propose_calls,
+                hit_rate, self.early_exit_layer,
             )
+            # Write to a temp file for external collection
+            try:
+                import json as _json
+                stats = {
+                    "total_calls": self._total_propose_calls,
+                    "total_hits": self._total_cache_hits,
+                    "hit_rate": round(hit_rate, 2),
+                    "early_exit_layer": self.early_exit_layer,
+                }
+                with open("/tmp/parallel_sd_cache_stats.json", "w") as _f:
+                    _json.dump(stats, _f)
+            except Exception:
+                pass
 
         # Clear per-call state
         self._sampled_token_ids = None
@@ -198,7 +334,7 @@ class ParallelProposer:
     # ------------------------------------------------------------------
 
     def _cache_lookup(self, batch_size: int) -> dict[int, list[int]]:
-        """Look up sampled_token_ids in previous round's caches."""
+        """Look up sampled_token_ids in current round's caches."""
         cache_hits: dict[int, list[int]] = {}
         if self._sampled_token_ids is None or self._request_ids is None:
             return cache_hits
@@ -276,6 +412,7 @@ class ParallelProposer:
         self,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
+        branch_hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
@@ -289,6 +426,12 @@ class ParallelProposer:
 
         For each request, determines PREFILL vs DECODE mode and generates
         branches at appropriate positions.
+
+        Args:
+            branch_hidden_states: Hidden states for root token computation
+                (may be from early exit layer).
+            target_hidden_states: Last-layer hidden states for draft model
+                propose calls.
         """
         if self._target_lm_head is None or self._request_ids is None:
             return
@@ -367,9 +510,24 @@ class ParallelProposer:
                 continue
 
             top_k_ids = self._compute_root_tokens(
-                target_hidden_states, hs_indices, self.top_k,
+                branch_hidden_states, hs_indices, self.top_k,
             )
             root_tokens_per_pos.append((active_reqs, top_k_ids))
+
+        # Save common_attn_metadata state before branch generation.
+        # EagleProposer.propose() modifies common_attn_metadata in place
+        # (seq_lens, num_actual_tokens, query_start_loc, etc.), so we
+        # must save and restore after each branch call to prevent
+        # cumulative corruption.
+        saved_seq_lens = common_attn_metadata.seq_lens.clone()
+        saved_num_actual_tokens = common_attn_metadata.num_actual_tokens
+        saved_max_query_len = common_attn_metadata.max_query_len
+        saved_query_start_loc = common_attn_metadata.query_start_loc
+        saved_query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        saved_seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        saved_num_computed_tokens_cpu = (
+            common_attn_metadata._num_computed_tokens_cpu
+        )
 
         # Generate branches: for each (pos, k), call underlying propose
         for pos_idx in range(max_branch_pos):
@@ -414,6 +572,23 @@ class ParallelProposer:
                     common_attn_metadata, sampling_metadata,
                     mm_embed_inputs, num_rejected_tokens_gpu,
                 ).clone()
+
+                # Restore common_attn_metadata to pre-branch state
+                common_attn_metadata.seq_lens.copy_(saved_seq_lens)
+                common_attn_metadata.num_actual_tokens = (
+                    saved_num_actual_tokens
+                )
+                common_attn_metadata.max_query_len = saved_max_query_len
+                common_attn_metadata.query_start_loc = (
+                    saved_query_start_loc
+                )
+                common_attn_metadata.query_start_loc_cpu = (
+                    saved_query_start_loc_cpu
+                )
+                common_attn_metadata._seq_lens_cpu = saved_seq_lens_cpu
+                common_attn_metadata._num_computed_tokens_cpu = (
+                    saved_num_computed_tokens_cpu
+                )
 
                 # Store draft tokens in per-request caches
                 for req_idx, key in branch_keys:

@@ -81,12 +81,20 @@ def create_static_sink_attention_backend(
             common_attn_metadata: CommonAttentionMetadata,
             fast_build: bool = False,
         ) -> AttentionMetadata:
-            common_attn_metadata.seq_lens[:] = (
-                common_attn_metadata.seq_lens + self.sink_len
-            )
-            common_attn_metadata.seq_lens[
-                common_attn_metadata.seq_lens == self.sink_len
-            ] = 0
+            # Save original REFERENCES (not data) so we can restore after
+            # build(). We create NEW tensors for the sink-adjusted values
+            # so that the built AttentionMetadata holds its own tensors,
+            # independent of the originals.
+            original_seq_lens = common_attn_metadata.seq_lens
+            original_max_seq_len = common_attn_metadata.max_seq_len
+            original_block_table = common_attn_metadata.block_table_tensor
+
+            # Create a NEW tensor with sink-adjusted seq_lens
+            # (not in-place modify, to avoid aliasing with metadata)
+            sink_seq_lens = common_attn_metadata.seq_lens + self.sink_len
+            sink_seq_lens[sink_seq_lens == self.sink_len] = 0
+            common_attn_metadata.seq_lens = sink_seq_lens
+
             common_attn_metadata.max_seq_len = (
                 common_attn_metadata.max_seq_len + self.sink_len
             )
@@ -94,12 +102,21 @@ def create_static_sink_attention_backend(
             num_reqs = common_attn_metadata.num_reqs
             self.block_table_with_sink[
                 :num_reqs, self.num_sink_blocks : self.num_sink_blocks + max_num_blocks
-            ] = common_attn_metadata.block_table_tensor[:, :max_num_blocks]
+            ] = original_block_table[:, :max_num_blocks]
             common_attn_metadata.block_table_tensor = self.block_table_with_sink[
                 :num_reqs
             ]
 
-            return super().build(common_prefix_len, common_attn_metadata, fast_build)
+            result = super().build(common_prefix_len, common_attn_metadata, fast_build)
+
+            # Restore original references (the built metadata keeps the
+            # sink-adjusted tensors; common_attn_metadata gets originals
+            # back so repeated calls don't accumulate sink_len).
+            common_attn_metadata.seq_lens = original_seq_lens
+            common_attn_metadata.max_seq_len = original_max_seq_len
+            common_attn_metadata.block_table_tensor = original_block_table
+
+            return result
 
     attn_backend = subclass_attention_backend(
         name_prefix=prefix,
