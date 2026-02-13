@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.reuse_cache import ReuseCache
 
@@ -56,6 +57,7 @@ class ParallelProposer:
         assert spec_config.method == "parallel"
 
         self._num_speculative_tokens = spec_config.num_speculative_tokens
+        self._draft_method = spec_config.parallel_draft_method or "eagle"
         self.top_k = spec_config.parallel_top_k
         self.enable_half_cache_hit = spec_config.parallel_enable_half_cache_hit
         self.early_exit_layer = spec_config.parallel_early_exit_layer
@@ -65,6 +67,8 @@ class ParallelProposer:
 
         # Target model's lm_head for root token computation
         self._target_lm_head: nn.Module | None = None
+        # Target model's final norm (for Eagle early-exit)
+        self._target_norm: nn.Module | None = None
 
         # Early exit support
         self._early_exit_hook_handle = None
@@ -117,6 +121,55 @@ class ParallelProposer:
             except AttributeError:
                 continue
         return None
+
+    # Standard norm accessor patterns for common model architectures
+    _NORM_ACCESSOR_PATTERNS = [
+        "model.norm",         # LLaMA, Qwen2, DeepSeek, most HF models
+        "transformer.norm",   # Some GPT-style models
+    ]
+
+    def _find_target_norm(
+        self, target_model: nn.Module,
+    ) -> nn.Module | None:
+        """Find the final RMSNorm/LayerNorm in the target model.
+
+        Tries standard naming conventions for the final normalization layer.
+
+        Returns:
+            The norm module, or None if not found.
+        """
+        for pattern in self._NORM_ACCESSOR_PATTERNS:
+            obj = target_model
+            try:
+                for attr in pattern.split("."):
+                    obj = getattr(obj, attr)
+                return obj
+            except AttributeError:
+                continue
+        return None
+
+    def _apply_target_norm(
+        self, hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the target model's final norm to hidden states.
+
+        Used for Eagle early-exit: intermediate layer hidden states are
+        pre-norm and need normalization before being fed to lm_head.
+
+        Args:
+            hidden_states: Pre-norm hidden states from early exit layer.
+
+        Returns:
+            Normalized hidden states.
+        """
+        if self._target_norm is not None:
+            return self._target_norm(hidden_states)
+        # Fallback: return as-is (may produce incorrect logits)
+        logger.warning(
+            "_apply_target_norm: no target norm found, "
+            "returning un-normalized hidden states"
+        )
+        return hidden_states
 
     def _setup_early_exit_hook(self, target_model: nn.Module) -> None:
         """Register a forward hook on the early exit layer.
@@ -205,6 +258,17 @@ class ParallelProposer:
                 "ParallelProposer: using TARGET model's compute_logits "
                 "for root tokens (avoids double normalization)"
             )
+
+        # For Eagle early-exit, we need the target model's final norm
+        # because Eagle's compute_logits does NOT apply norm internally
+        # (unlike MTP's SharedHead which has norm built in).
+        if self._draft_method in ("eagle", "eagle3"):
+            self._target_norm = self._find_target_norm(target_model)
+            if self._target_norm is not None:
+                logger.info(
+                    "ParallelProposer: found target model's final norm "
+                    "for Eagle early-exit normalization"
+                )
 
         # Set up early exit forward hook if needed
         if self.early_exit_layer != -1:
@@ -406,6 +470,8 @@ class ParallelProposer:
         positions: list[int],
         top_k: int,
         is_early_exit: bool = False,
+        sampling_metadata: "SamplingMetadata | None" = None,
+        active_reqs: list[int] | None = None,
     ) -> torch.Tensor:
         """Compute root tokens from hidden states.
 
@@ -421,6 +487,10 @@ class ParallelProposer:
             top_k: Number of top candidates per position.
             is_early_exit: True if hidden_states come from an early exit
                 hook (pre-norm), False if from target model output (post-norm).
+            sampling_metadata: If provided, penalties (repetition, frequency,
+                presence) are applied to logits to match rejection sampler.
+            active_reqs: Request indices corresponding to each position,
+                needed for per-request penalty lookup.
 
         Returns:
             Tensor of shape [num_positions, top_k] with token IDs.
@@ -432,12 +502,13 @@ class ParallelProposer:
 
         with torch.no_grad():
             if is_early_exit:
-                # Early exit HS are pre-norm → use draft model's
-                # compute_logits which applies SharedHead.norm() internally
-                logits = self._underlying.model.compute_logits(selected_hs)
+                if self._draft_method == "mtp":
+                    logits = self._underlying.model.compute_logits(
+                        selected_hs)
+                else:
+                    normed_hs = self._apply_target_norm(selected_hs)
+                    logits = self._target_model.compute_logits(normed_hs)
             else:
-                # Target HS are post-norm → use target model's
-                # compute_logits which does NOT apply extra norm
                 logits = self._target_model.compute_logits(selected_hs)
 
         if logits is None:
@@ -446,14 +517,73 @@ class ParallelProposer:
                 "is_early_exit=%s, positions=%s, hs_shape=%s",
                 is_early_exit, positions, hidden_states.shape,
             )
-            # Fallback: return zeros
             return torch.zeros(
                 len(positions), top_k,
                 dtype=torch.long, device=hidden_states.device,
             )
 
+        # Apply sampling penalties (repetition, frequency, presence) to
+        # match the rejection sampler. Without this, root tokens computed
+        # from raw logits may not match the penalized argmax that the
+        # rejection sampler produces, causing cache misses.
+        if (sampling_metadata is not None
+                and not sampling_metadata.no_penalties
+                and active_reqs is not None):
+            logits = self._apply_sampling_penalties(
+                logits, sampling_metadata, active_reqs)
+
         _, top_k_ids = torch.topk(logits, k=top_k, dim=-1)
         return top_k_ids
+
+    def _apply_sampling_penalties(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: "SamplingMetadata",
+        active_reqs: list[int],
+    ) -> torch.Tensor:
+        """Apply the same penalties that the rejection sampler applies.
+
+        This ensures root tokens match what the rejection sampler actually
+        produces, preventing cache misses due to penalty-modified argmax.
+        """
+        num_positions = logits.shape[0]
+        if num_positions == 0:
+            return logits
+
+        # Build per-position → per-request mapping
+        repeat_indices = torch.tensor(
+            active_reqs, dtype=torch.long,
+            device=logits.device)
+
+        # Get penalty parameters expanded to per-position
+        prompt_token_ids = sampling_metadata.prompt_token_ids
+        if prompt_token_ids is None:
+            return logits
+        prompt_token_ids = prompt_token_ids[repeat_indices]
+        presence_penalties = sampling_metadata.presence_penalties[
+            repeat_indices]
+        frequency_penalties = sampling_metadata.frequency_penalties[
+            repeat_indices]
+        repetition_penalties = sampling_metadata.repetition_penalties[
+            repeat_indices]
+
+        # Use same output_token_ids for all positions of same request
+        # (ignoring per-position spec token differences, which is a
+        # negligible approximation)
+        output_token_ids = [
+            sampling_metadata.output_token_ids[r] for r in active_reqs]
+
+        # Convert logits to float32 for penalty application
+        logits_f32 = logits.to(torch.float32)
+        logits_f32 = apply_all_penalties(
+            logits_f32,
+            prompt_token_ids,
+            presence_penalties,
+            frequency_penalties,
+            repetition_penalties,
+            output_token_ids,
+        )
+        return logits_f32
 
     def _generate_branches(
         self,
@@ -562,6 +692,8 @@ class ParallelProposer:
             top_k_ids = self._compute_root_tokens(
                 branch_hidden_states, hs_indices, self.top_k,
                 is_early_exit=is_early_exit,
+                sampling_metadata=sampling_metadata,
+                active_reqs=active_reqs,
             )
             root_tokens_per_pos.append((active_reqs, top_k_ids))
 
