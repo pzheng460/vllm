@@ -191,13 +191,19 @@ class ParallelProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         self._underlying.load_model(target_model)
-        # After load_model, the draft model shares lm_head with target,
-        # so we can use self._underlying.model.compute_logits() for
-        # root token computation.
-        if hasattr(self._underlying.model, "compute_logits"):
-            self._target_lm_head = True  # Flag: compute_logits available
+
+        # Save reference to target model for root token computation.
+        # IMPORTANT: Must use TARGET model's compute_logits, NOT the
+        # draft model's. The draft model's compute_logits (MTP) applies
+        # SharedHead.norm(hidden_states) internally, but target_hidden_states
+        # already has final RMSNorm applied from the target model's forward
+        # pass. Using the draft model's compute_logits would double-normalize.
+        self._target_model = target_model
+        if hasattr(target_model, "compute_logits"):
+            self._target_lm_head = True
             logger.info(
-                "ParallelProposer: compute_logits available for root tokens"
+                "ParallelProposer: using TARGET model's compute_logits "
+                "for root tokens (avoids double normalization)"
             )
 
         # Set up early exit forward hook if needed
@@ -234,9 +240,8 @@ class ParallelProposer:
 
         # Get early exit hidden states (if available) for branch generation
         early_exit_hs = self.get_early_exit_hidden_states()
-        branch_hs = (early_exit_hs
-                     if early_exit_hs is not None
-                     else target_hidden_states)
+        using_early_exit = early_exit_hs is not None
+        branch_hs = early_exit_hs if using_early_exit else target_hidden_states
 
         # Phase 4: Branch Generation for CURRENT round
         # Must run first so cache is populated before lookup.
@@ -250,6 +255,7 @@ class ParallelProposer:
                 next_token_ids, effective_lti, common_attn_metadata,
                 sampling_metadata, mm_embed_inputs,
                 num_rejected_tokens_gpu, batch_size,
+                is_early_exit=using_early_exit,
             )
         except RuntimeError as e:
             logger.debug("Branch generation skipped: %s", e)
@@ -272,25 +278,41 @@ class ParallelProposer:
             for t in range(n):
                 fallback[req_idx, t] = cached_tokens[t]
 
-        # Track cache hit statistics
+        # Track cache hit statistics (using ReuseCache's own counters)
         self._total_propose_calls += batch_size
         self._total_cache_hits += len(cache_hits)
         if self._total_propose_calls % 20 == 0 and self._total_propose_calls > 0:
-            hit_rate = (self._total_cache_hits / self._total_propose_calls
-                        * 100)
+            # Collect detailed stats from all active caches
+            global_stats = self.get_cache_statistics()["global"]
+            total_hit = global_stats["hit"]
+            total_half = global_stats["half_hit"]
+            total_miss = global_stats["miss"]
+            total_lookups = total_hit + total_half + total_miss
+            hit_rate = (total_hit / total_lookups * 100
+                        if total_lookups > 0 else 0.0)
+            half_rate = (total_half / total_lookups * 100
+                         if total_lookups > 0 else 0.0)
             logger.warning(
-                "Parallel-SD cache stats: %d/%d hits (%.1f%%), "
+                "Parallel-SD cache stats: hit=%d half=%d miss=%d "
+                "total=%d (hit=%.1f%% half=%.1f%%), "
                 "early_exit_layer=%d",
-                self._total_cache_hits, self._total_propose_calls,
-                hit_rate, self.early_exit_layer,
+                total_hit, total_half, total_miss, total_lookups,
+                hit_rate, half_rate, self.early_exit_layer,
             )
             # Write to a temp file for external collection
             try:
                 import json as _json
                 stats = {
                     "total_calls": self._total_propose_calls,
-                    "total_hits": self._total_cache_hits,
+                    "total_lookups": total_lookups,
+                    "total_hits": total_hit,
+                    "total_half_hits": total_half,
+                    "total_misses": total_miss,
                     "hit_rate": round(hit_rate, 2),
+                    "half_hit_rate": round(half_rate, 2),
+                    "combined_hit_rate": round(
+                        (total_hit + total_half) / total_lookups * 100
+                        if total_lookups > 0 else 0.0, 2),
                     "early_exit_layer": self.early_exit_layer,
                 }
                 with open("/tmp/parallel_sd_cache_stats.json", "w") as _f:
@@ -383,16 +405,22 @@ class ParallelProposer:
         hidden_states: torch.Tensor,
         positions: list[int],
         top_k: int,
+        is_early_exit: bool = False,
     ) -> torch.Tensor:
-        """Compute root tokens using the draft model's compute_logits.
+        """Compute root tokens from hidden states.
 
-        The draft model shares lm_head weights with the target model,
-        so compute_logits produces target-equivalent logits.
+        Uses different compute_logits paths depending on the source:
+        - target_hidden_states (post-norm): Use TARGET model's compute_logits
+          which expects already-normalized hidden states (no extra norm).
+        - early_exit hidden states (pre-norm): Use DRAFT model's compute_logits
+          which applies SharedHead.norm() internally (needed for un-normed hs).
 
         Args:
             hidden_states: [num_tokens, hidden_size]
             positions: Absolute token indices to extract.
             top_k: Number of top candidates per position.
+            is_early_exit: True if hidden_states come from an early exit
+                hook (pre-norm), False if from target model output (post-norm).
 
         Returns:
             Tensor of shape [num_positions, top_k] with token IDs.
@@ -403,7 +431,26 @@ class ParallelProposer:
         selected_hs = hidden_states[pos_tensor]
 
         with torch.no_grad():
-            logits = self._underlying.model.compute_logits(selected_hs)
+            if is_early_exit:
+                # Early exit HS are pre-norm → use draft model's
+                # compute_logits which applies SharedHead.norm() internally
+                logits = self._underlying.model.compute_logits(selected_hs)
+            else:
+                # Target HS are post-norm → use target model's
+                # compute_logits which does NOT apply extra norm
+                logits = self._target_model.compute_logits(selected_hs)
+
+        if logits is None:
+            logger.warning(
+                "_compute_root_tokens: logits is None! "
+                "is_early_exit=%s, positions=%s, hs_shape=%s",
+                is_early_exit, positions, hidden_states.shape,
+            )
+            # Fallback: return zeros
+            return torch.zeros(
+                len(positions), top_k,
+                dtype=torch.long, device=hidden_states.device,
+            )
 
         _, top_k_ids = torch.topk(logits, k=top_k, dim=-1)
         return top_k_ids
@@ -421,6 +468,7 @@ class ParallelProposer:
         mm_embed_inputs: tuple | None,
         num_rejected_tokens_gpu: torch.Tensor | None,
         batch_size: int,
+        is_early_exit: bool = False,
     ) -> None:
         """Generate branch continuations and store in per-request caches.
 
@@ -432,6 +480,8 @@ class ParallelProposer:
                 (may be from early exit layer).
             target_hidden_states: Last-layer hidden states for draft model
                 propose calls.
+            is_early_exit: True if branch_hidden_states come from early
+                exit hook (pre-norm), affecting compute_logits path.
         """
         if self._target_lm_head is None or self._request_ids is None:
             return
@@ -453,8 +503,8 @@ class ParallelProposer:
             qe = int(qsl_cpu[i + 1].item())
             ql = qe - qs
 
-            # PREFILL vs DECODE detection
-            is_prefill = self._is_prefill_request(i)
+            # PREFILL vs DECODE detection (use query length, not valid token count)
+            is_prefill = self._is_prefill_request(i, ql)
 
             # Get input_ids for cache key construction
             req_input_ids = target_token_ids[qs:qe].tolist()
@@ -511,6 +561,7 @@ class ParallelProposer:
 
             top_k_ids = self._compute_root_tokens(
                 branch_hidden_states, hs_indices, self.top_k,
+                is_early_exit=is_early_exit,
             )
             root_tokens_per_pos.append((active_reqs, top_k_ids))
 
@@ -602,22 +653,16 @@ class ParallelProposer:
             batch_size, max_branch_pos, self.top_k,
         )
 
-    def _is_prefill_request(self, req_idx: int) -> bool:
-        """Detect if request is in PREFILL mode."""
-        if self._sampled_token_ids is None:
-            return True
-        if isinstance(self._sampled_token_ids, torch.Tensor):
-            if self._sampled_token_ids.dim() == 1:
-                return True
-            row = self._sampled_token_ids[req_idx]
-            valid = int((row != -1).sum().item())
-            return valid <= 1
-        else:
-            tokens = self._sampled_token_ids[req_idx]
-            if isinstance(tokens, (list, tuple)):
-                valid = sum(1 for t in tokens if t != -1)
-                return valid <= 1
-            return True
+    def _is_prefill_request(self, req_idx: int, query_length: int) -> bool:
+        """Detect if request is in PREFILL mode.
+
+        Uses query length to distinguish PREFILL (long prompt) from DECODE
+        (short verification input of num_spec + 1 tokens). This is more
+        reliable than counting valid tokens in sampled_token_ids, because
+        after a rejected draft, sampled_token_ids has only 1 valid token
+        which would be incorrectly classified as PREFILL.
+        """
+        return query_length > self._num_speculative_tokens + 1
 
     # ------------------------------------------------------------------
     # Statistics

@@ -73,9 +73,9 @@ def parse_args():
     )
     parser.add_argument(
         "--top-k",
-        type=int,
-        default=1,
-        help="Top-k candidates for branch generation",
+        type=str,
+        default="1",
+        help="Comma-separated top-k values (e.g. '1,2,3')",
     )
     parser.add_argument(
         "--num-speculative-tokens",
@@ -145,6 +145,11 @@ def parse_args():
         help="Random seed",
     )
     parser.add_argument(
+        "--enable-half-cache-hit",
+        action="store_true",
+        help="Enable half-cache-hit (prefix match fallback, top_k=1 only)",
+    )
+    parser.add_argument(
         "--skip-baseline",
         action="store_true",
         help="Skip MTP baseline run",
@@ -206,13 +211,17 @@ def start_server(run_spec, port):
     stderr_file = tempfile.NamedTemporaryFile(
         mode="w", prefix="vllm_stderr_", suffix=".log", delete=False
     )
+    stdout_file = tempfile.NamedTemporaryFile(
+        mode="w", prefix="vllm_stdout_", suffix=".log", delete=False
+    )
     stderr_path = stderr_file.name
+    stdout_path = stdout_file.name
 
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=stderr_file,
+        cmd, stdout=stdout_file, stderr=stderr_file,
         env=os.environ.copy(),
     )
-    return proc, stderr_path
+    return proc, stderr_path, stdout_path
 
 
 def wait_for_server(port, timeout=300):
@@ -383,7 +392,7 @@ def run_config(run_spec, port):
         os.unlink(cache_stats_path)
 
     # Start server
-    proc, stderr_path = start_server(run_spec, port)
+    proc, stderr_path, stdout_path = start_server(run_spec, port)
     try:
         if not wait_for_server(port):
             logger.error("Server failed to start for %s", config_name)
@@ -416,45 +425,58 @@ def run_config(run_spec, port):
 
     finally:
         stop_server(proc)
-        # Read server stderr from temp file for cache hit stats
+        # Read server logs from temp files
         server_stderr = ""
+        server_stdout = ""
         try:
             with open(stderr_path, "r", errors="replace") as f:
                 server_stderr = f.read()
-            logger.info("Server stderr file: %s (%d bytes)",
-                        stderr_path, len(server_stderr))
-            # Check for cache stats
-            cache_lines = [l for l in server_stderr.splitlines()
-                           if "cache" in l.lower() or "Parallel" in l]
-            if cache_lines:
-                for cl in cache_lines[-5:]:
-                    logger.info("  [stderr] %s", cl)
-            else:
-                logger.info("  No cache/Parallel lines found in stderr")
+            with open(stdout_path, "r", errors="replace") as f:
+                server_stdout = f.read()
+            logger.info("Server stderr: %d bytes, stdout: %d bytes",
+                        len(server_stderr), len(server_stdout))
+            # Check for cache miss debug info in stdout
+            miss_lines = [l for l in server_stdout.splitlines()
+                          if "Cache MISS debug" in l]
+            if miss_lines:
+                logger.info("  Cache miss debug (%d misses):", len(miss_lines))
+                for ml in miss_lines[:10]:
+                    logger.info("    %s", ml.strip())
+            os.unlink(stderr_path)
+            os.unlink(stdout_path)
         except Exception as e:
-            logger.error("Failed to read stderr file: %s", e)
+            logger.debug("Failed to read log files: %s", e)
 
     # Collect results
     total_output_tokens = sum(o["completion_tokens"] for o in outputs)
     tokens_per_sec = total_output_tokens / elapsed if elapsed > 0 else 0.0
     spec_metrics = compute_delta(metrics_before, metrics_after, num_spec)
 
-    # Extract cache hit rate from temp file written by ParallelProposer
-    cache_hit_rate = None
+    # Extract cache stats from temp file written by ParallelProposer
     cache_stats_path = "/tmp/parallel_sd_cache_stats.json"
     try:
         if os.path.exists(cache_stats_path):
             with open(cache_stats_path, "r") as f:
                 cache_stats = json.load(f)
-            cache_hit_rate = cache_stats.get("hit_rate")
-            logger.info("  Cache stats: %d/%d hits (%.1f%%), layer=%d",
-                        cache_stats["total_hits"], cache_stats["total_calls"],
-                        cache_stats["hit_rate"], cache_stats["early_exit_layer"])
+            spec_metrics["cache_hit_rate"] = cache_stats.get("hit_rate", 0)
+            spec_metrics["cache_half_hit_rate"] = cache_stats.get(
+                "half_hit_rate", 0)
+            spec_metrics["cache_combined_hit_rate"] = cache_stats.get(
+                "combined_hit_rate", 0)
+            logger.info(
+                "  Cache stats: hit=%d half=%d miss=%d "
+                "(hit=%.1f%% half=%.1f%% combined=%.1f%%), layer=%d",
+                cache_stats.get("total_hits", 0),
+                cache_stats.get("total_half_hits", 0),
+                cache_stats.get("total_misses", 0),
+                cache_stats.get("hit_rate", 0),
+                cache_stats.get("half_hit_rate", 0),
+                cache_stats.get("combined_hit_rate", 0),
+                cache_stats.get("early_exit_layer", 0),
+            )
             os.unlink(cache_stats_path)
     except Exception as e:
         logger.debug("Failed to read cache stats: %s", e)
-    if cache_hit_rate is not None:
-        spec_metrics["cache_hit_rate"] = cache_hit_rate
 
     # Show first output for sanity check
     if outputs:
@@ -548,8 +570,9 @@ def compute_text_match_rate(baseline_texts, test_texts):
 def main():
     args = parse_args()
 
-    # Parse comma-separated early exit layers
+    # Parse comma-separated early exit layers and top-k values
     early_exit_layers = [int(x) for x in args.early_exit_layers.split(",")]
+    top_k_values = [int(x) for x in args.top_k.split(",")]
 
     prompts = load_prompts(args)
     results = []
@@ -593,39 +616,47 @@ def main():
             results.append(baseline_result)
 
     # ----------------------------------------------------------------
-    # Config 2+: Parallel-SD with different early_exit_layer values
+    # Config 2+: Parallel-SD with different early_exit_layer and top_k
     # ----------------------------------------------------------------
     for layer in early_exit_layers:
-        run_spec = dict(base_spec)
-        run_spec["config_name"] = f"Parallel layer={layer}"
-        spec_cfg = {
-            "method": "parallel",
-            "num_speculative_tokens": args.num_speculative_tokens,
-            "parallel_draft_method": args.draft_method,
-            "parallel_top_k": args.top_k,
-            "parallel_early_exit_layer": layer,
-        }
-        # For MTP, don't specify model (vllm auto-fills from target).
-        # For eagle/eagle3, need explicit draft model path.
-        if args.draft_method not in ("mtp",):
-            spec_cfg["model"] = draft_model
-            spec_cfg["draft_tensor_parallel_size"] = 1
-        run_spec["spec_config"] = spec_cfg
-        result = run_config(run_spec, port)
-        if result is None:
-            logger.error("Skipping failed config: Parallel layer=%d", layer)
-            continue
-
-        # Compute text match rate vs baseline
-        if baseline_result is not None:
-            match_rate = compute_text_match_rate(
-                baseline_result["output_texts"],
-                result["output_texts"],
+        for top_k in top_k_values:
+            run_spec = dict(base_spec)
+            hh_tag = "+hh" if args.enable_half_cache_hit else ""
+            run_spec["config_name"] = (
+                f"Parallel{hh_tag} L={layer} k={top_k}"
             )
-            result["text_match_rate_vs_baseline"] = round(match_rate, 2)
-            logger.info("  Text match vs baseline: %.2f%%", match_rate)
+            spec_cfg = {
+                "method": "parallel",
+                "num_speculative_tokens": args.num_speculative_tokens,
+                "parallel_draft_method": args.draft_method,
+                "parallel_top_k": top_k,
+                "parallel_early_exit_layer": layer,
+                "parallel_enable_half_cache_hit": args.enable_half_cache_hit,
+            }
+            # For MTP, don't specify model (vllm auto-fills from target).
+            # For eagle/eagle3, need explicit draft model path.
+            if args.draft_method not in ("mtp",):
+                spec_cfg["model"] = draft_model
+                spec_cfg["draft_tensor_parallel_size"] = 1
+            run_spec["spec_config"] = spec_cfg
+            result = run_config(run_spec, port)
+            if result is None:
+                logger.error(
+                    "Skipping failed config: Parallel layer=%d k=%d",
+                    layer, top_k,
+                )
+                continue
 
-        results.append(result)
+            # Compute text match rate vs baseline
+            if baseline_result is not None:
+                match_rate = compute_text_match_rate(
+                    baseline_result["output_texts"],
+                    result["output_texts"],
+                )
+                result["text_match_rate_vs_baseline"] = round(match_rate, 2)
+                logger.info("  Text match vs baseline: %.2f%%", match_rate)
+
+            results.append(result)
 
     # ----------------------------------------------------------------
     # Summary
@@ -634,34 +665,37 @@ def main():
         logger.error("No results collected!")
         return
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
     print("EXPERIMENT SUMMARY")
-    print("=" * 90)
+    print("=" * 100)
     print(
         f"{'Config':<25} {'Tokens/s':>10} {'Acceptance':>12} "
-        f"{'Accept Rate':>12} {'Cache%':>8} {'Match%':>8}"
+        f"{'Accept Rate':>12} {'Hit%':>7} {'Half%':>7} {'Comb%':>7} "
+        f"{'Match%':>8}"
     )
-    print("-" * 90)
+    print("-" * 100)
     for r in results:
+        sm = r.get("spec_metrics", {})
         match_str = (
             f"{r.get('text_match_rate_vs_baseline', '-'):>7}"
             if isinstance(r.get("text_match_rate_vs_baseline"), float)
             else f"{'N/A':>7}"
         )
-        cache_str = (
-            f"{r['spec_metrics']['cache_hit_rate']:>7.1f}"
-            if "cache_hit_rate" in r.get("spec_metrics", {})
-            else f"{'N/A':>7}"
-        )
+        hit_str = (f"{sm['cache_hit_rate']:>6.1f}"
+                   if "cache_hit_rate" in sm else f"{'N/A':>6}")
+        half_str = (f"{sm['cache_half_hit_rate']:>6.1f}"
+                    if "cache_half_hit_rate" in sm else f"{'N/A':>6}")
+        comb_str = (f"{sm['cache_combined_hit_rate']:>6.1f}"
+                    if "cache_combined_hit_rate" in sm else f"{'N/A':>6}")
         print(
             f"{r['config_name']:<25} "
             f"{r['tokens_per_sec']:>10.2f} "
-            f"{r['spec_metrics']['mean_acceptance_length']:>12.3f} "
-            f"{r['spec_metrics']['draft_acceptance_rate']:>11.2f}% "
-            f"{cache_str} "
+            f"{sm['mean_acceptance_length']:>12.3f} "
+            f"{sm['draft_acceptance_rate']:>11.2f}% "
+            f"{hit_str} {half_str} {comb_str} "
             f"{match_str}"
         )
-    print("=" * 90)
+    print("=" * 100)
 
     # Save results
     if args.save_results:
