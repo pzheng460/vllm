@@ -14,13 +14,15 @@ wraps EagleSpeculator at the Speculator level (vllm/v1/worker/gpu/spec_decode/).
 import logging
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import set_forward_context
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.ops.penalties import apply_all_penalties
-from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, EagleProposer
 from vllm.v1.spec_decode.reuse_cache import ReuseCache
 
 logger = logging.getLogger(__name__)
@@ -31,10 +33,14 @@ class ParallelProposer:
 
     Wraps an EagleProposer with a Reuse Cache mechanism. On each
     propose() call:
-    1. (Phase 4) Generates branches and stores in current round's cache
+    1. (Phase 4) Generates branches from current hidden_states → cache
     2. (Phase 1) Looks up sampled_token_ids in current round's cache
     3. (Phase 2) Runs standard fallback propose
     4. (Phase 3) Merges cache hits into fallback result
+
+    Branch generation MUST run before cache lookup because both the
+    branch keys and lookup keys reference the same draft tokens (the
+    ones currently being verified by the target model).
     """
 
     # Standard layer accessor patterns for common model architectures
@@ -61,6 +67,9 @@ class ParallelProposer:
         self.top_k = spec_config.parallel_top_k
         self.enable_half_cache_hit = spec_config.parallel_enable_half_cache_hit
         self.early_exit_layer = spec_config.parallel_early_exit_layer
+        self.enable_concurrent = getattr(
+            spec_config, "parallel_enable_concurrent", False,
+        )
 
         # Per-request reuse caches: request_id -> ReuseCache
         self._reuse_caches: dict[str, ReuseCache] = {}
@@ -85,12 +94,18 @@ class ParallelProposer:
         self._global_miss: int = 0
         self._global_half_hit: int = 0
 
+        # CUDA stream for concurrent branch generation
+        self._draft_stream: torch.cuda.Stream | None = None
+        if self.enable_concurrent and device.type == "cuda":
+            self._draft_stream = torch.cuda.Stream(device=device)
+
         logger.info(
             "ParallelProposer initialized: top_k=%d, "
             "half_cache_hit=%s, num_spec_tokens=%d, "
-            "early_exit_layer=%d",
+            "early_exit_layer=%d, concurrent=%s",
             self.top_k, self.enable_half_cache_hit,
             self._num_speculative_tokens, self.early_exit_layer,
+            self.enable_concurrent,
         )
 
     def __getattr__(self, name):
@@ -288,11 +303,15 @@ class ParallelProposer:
     ) -> torch.Tensor:
         """Generate draft tokens with Parallel-SD cache mechanism.
 
-        Implements a 4-phase algorithm:
-          Phase 4: Generate branches for current round (populate cache)
+        Algorithm (same-round cache):
+          Phase 4: Generate branches from current hidden_states → cache
           Phase 1: Look up sampled_token_ids in current round's cache
           Phase 2: Standard propose as fallback
           Phase 3: Merge cache hits into fallback result
+
+        Branch generation MUST run before cache lookup because both
+        the branch keys and the lookup keys reference the SAME draft
+        tokens (the ones being verified in the current round).
         """
         batch_size = next_token_ids.shape[0]
 
@@ -302,16 +321,13 @@ class ParallelProposer:
         else:
             effective_lti = last_token_indices
 
-        # Get early exit hidden states (if available) for branch generation
+        # Phase 4: Generate branches for current round (populate cache)
+        # Uses early exit hidden states (if configured) for root token
+        # computation.
         early_exit_hs = self.get_early_exit_hidden_states()
         using_early_exit = early_exit_hs is not None
         branch_hs = early_exit_hs if using_early_exit else target_hidden_states
 
-        # Phase 4: Branch Generation for CURRENT round
-        # Must run first so cache is populated before lookup.
-        # Uses early exit hidden states (if configured) for root token
-        # computation, but fallback propose still uses target_hidden_states
-        # (draft model needs last-layer HS).
         try:
             self._generate_branches(
                 target_token_ids, target_positions,
@@ -324,9 +340,7 @@ class ParallelProposer:
         except RuntimeError as e:
             logger.debug("Branch generation skipped: %s", e)
 
-        # Phase 1: Cache Lookup (in CURRENT round's cache)
-        # Now that branches are generated and stored, lookup by
-        # sampled_token_ids finds matching branches from this round.
+        # Phase 1: Cache Lookup (in current round's cache)
         cache_hits = self._cache_lookup(batch_size)
 
         # Phase 2: Fallback (standard propose)
@@ -342,11 +356,10 @@ class ParallelProposer:
             for t in range(n):
                 fallback[req_idx, t] = cached_tokens[t]
 
-        # Track cache hit statistics (using ReuseCache's own counters)
+        # Track cache hit statistics
         self._total_propose_calls += batch_size
         self._total_cache_hits += len(cache_hits)
         if self._total_propose_calls % 20 == 0 and self._total_propose_calls > 0:
-            # Collect detailed stats from all active caches
             global_stats = self.get_cache_statistics()["global"]
             total_hit = global_stats["hit"]
             total_half = global_stats["half_hit"]
@@ -363,7 +376,6 @@ class ParallelProposer:
                 total_hit, total_half, total_miss, total_lookups,
                 hit_rate, half_rate, self.early_exit_layer,
             )
-            # Write to a temp file for external collection
             try:
                 import json as _json
                 stats = {
@@ -697,22 +709,8 @@ class ParallelProposer:
             )
             root_tokens_per_pos.append((active_reqs, top_k_ids))
 
-        # Save common_attn_metadata state before branch generation.
-        # EagleProposer.propose() modifies common_attn_metadata in place
-        # (seq_lens, num_actual_tokens, query_start_loc, etc.), so we
-        # must save and restore after each branch call to prevent
-        # cumulative corruption.
-        saved_seq_lens = common_attn_metadata.seq_lens.clone()
-        saved_num_actual_tokens = common_attn_metadata.num_actual_tokens
-        saved_max_query_len = common_attn_metadata.max_query_len
-        saved_query_start_loc = common_attn_metadata.query_start_loc
-        saved_query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        saved_seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-        saved_num_computed_tokens_cpu = (
-            common_attn_metadata._num_computed_tokens_cpu
-        )
-
-        # Generate branches: for each (pos, k), call underlying propose
+        # Collect all branches into a flat list for batched generation.
+        branches: list[dict] = []
         for pos_idx in range(max_branch_pos):
             rt_info = root_tokens_per_pos[pos_idx]
             if rt_info is None:
@@ -720,69 +718,58 @@ class ParallelProposer:
             active_reqs, top_k_ids = rt_info
 
             for k_idx in range(self.top_k):
-                branch_next_tokens = next_token_ids.clone()
-                branch_lti = last_token_indices.clone()
-                branch_keys: list[tuple[int, tuple[int, ...]]] = []
-
                 for j, req_idx in enumerate(active_reqs):
                     info = request_infos[req_idx]
                     pos = info["branch_positions"][pos_idx]
                     root_token = top_k_ids[j, k_idx].item()
 
-                    # Set root token as the next_token for this request
-                    branch_next_tokens[req_idx] = root_token
-
-                    # Adjust last_token_indices to point to position p
-                    branch_lti[req_idx] = info["qs"] + pos
-
-                    # Build cache key
                     if info["is_prefill"]:
                         key = (root_token,)
                     else:
                         draft_prefix = info["input_ids"][1:pos + 1]
                         key = tuple(draft_prefix) + (root_token,)
 
-                    branch_keys.append((req_idx, key))
+                    branches.append({
+                        "req_idx": req_idx,
+                        "pos": pos,
+                        "root_token": root_token,
+                        "cache_key": key,
+                        "qs": info["qs"],
+                        "ql": info["ql"],
+                    })
 
-                if not branch_keys:
-                    continue
+        if not branches:
+            return
 
-                # Call underlying propose with modified inputs
-                branch_result = self._underlying.propose(
-                    target_token_ids, target_positions,
-                    target_hidden_states,
-                    branch_next_tokens, branch_lti,
-                    common_attn_metadata, sampling_metadata,
-                    mm_embed_inputs, num_rejected_tokens_gpu,
-                ).clone()
+        # Decide: batched (fast) vs serial (fallback) generation.
+        eagle = self._underlying
+        total_expanded_tokens = sum(b["ql"] for b in branches)
+        use_batched = (
+            not eagle.uses_mrope
+            and total_expanded_tokens <= eagle.max_num_tokens
+            and len(branches) + 1 <= eagle.arange.shape[0]
+        )
 
-                # Restore common_attn_metadata to pre-branch state
-                common_attn_metadata.seq_lens.copy_(saved_seq_lens)
-                common_attn_metadata.num_actual_tokens = (
-                    saved_num_actual_tokens
-                )
-                common_attn_metadata.max_query_len = saved_max_query_len
-                common_attn_metadata.query_start_loc = (
-                    saved_query_start_loc
-                )
-                common_attn_metadata.query_start_loc_cpu = (
-                    saved_query_start_loc_cpu
-                )
-                common_attn_metadata._seq_lens_cpu = saved_seq_lens_cpu
-                common_attn_metadata._num_computed_tokens_cpu = (
-                    saved_num_computed_tokens_cpu
-                )
-
-                # Store draft tokens in per-request caches
-                for req_idx, key in branch_keys:
-                    req_id = self._request_ids[req_idx]
-                    cache = self._get_or_create_cache(req_id)
-                    draft_tokens = branch_result[req_idx].tolist()
-                    cache.store_branch(key, draft_tokens)
+        if use_batched:
+            self._batched_branch_generate(
+                branches, target_token_ids, target_positions,
+                target_hidden_states, common_attn_metadata,
+                num_rejected_tokens_gpu,
+            )
+        else:
+            self._serial_branch_generate(
+                branches, target_token_ids, target_positions,
+                target_hidden_states, next_token_ids,
+                last_token_indices, common_attn_metadata,
+                sampling_metadata, mm_embed_inputs,
+                num_rejected_tokens_gpu, batch_size,
+            )
 
         logger.debug(
-            "Branch generation: batch_size=%d, max_pos=%d, top_k=%d",
-            batch_size, max_branch_pos, self.top_k,
+            "Branch generation: batch_size=%d, branches=%d, "
+            "batched=%s, max_pos=%d, top_k=%d",
+            batch_size, len(branches), use_batched,
+            max_branch_pos, self.top_k,
         )
 
     def _is_prefill_request(self, req_idx: int, query_length: int) -> bool:
@@ -795,6 +782,428 @@ class ParallelProposer:
         which would be incorrectly classified as PREFILL.
         """
         return query_length > self._num_speculative_tokens + 1
+
+    # ------------------------------------------------------------------
+    # Serial branch generation (fallback)
+    # ------------------------------------------------------------------
+
+    def _serial_branch_generate(
+        self,
+        branches: list[dict],
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: "SamplingMetadata",
+        mm_embed_inputs: tuple | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        batch_size: int,
+    ) -> None:
+        """Fallback: generate branches via underlying propose calls.
+
+        Groups non-conflicting branches (different req_idx) into
+        single propose calls to reduce overhead.
+        """
+        # Save common_attn_metadata state.
+        saved_seq_lens = common_attn_metadata.seq_lens.clone()
+        saved_num_actual_tokens = common_attn_metadata.num_actual_tokens
+        saved_max_query_len = common_attn_metadata.max_query_len
+        saved_query_start_loc = common_attn_metadata.query_start_loc
+        saved_query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        saved_seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        saved_num_computed_tokens_cpu = (
+            common_attn_metadata._num_computed_tokens_cpu
+        )
+
+        # Group non-conflicting branches into batches. Branches
+        # with different req_idx can share a single propose call.
+        call_groups: list[list[dict]] = []
+        for b in branches:
+            placed = False
+            for group in call_groups:
+                if not any(g["req_idx"] == b["req_idx"] for g in group):
+                    group.append(b)
+                    placed = True
+                    break
+            if not placed:
+                call_groups.append([b])
+
+        for group in call_groups:
+            branch_next_tokens = next_token_ids.clone()
+            branch_lti = last_token_indices.clone()
+
+            for b in group:
+                branch_next_tokens[b["req_idx"]] = b["root_token"]
+                branch_lti[b["req_idx"]] = b["qs"] + b["pos"]
+
+            branch_result = self._underlying.propose(
+                target_token_ids, target_positions,
+                target_hidden_states,
+                branch_next_tokens, branch_lti,
+                common_attn_metadata, sampling_metadata,
+                mm_embed_inputs, num_rejected_tokens_gpu,
+            ).clone()
+
+            # Restore common_attn_metadata
+            common_attn_metadata.seq_lens.copy_(saved_seq_lens)
+            common_attn_metadata.num_actual_tokens = (
+                saved_num_actual_tokens
+            )
+            common_attn_metadata.max_query_len = saved_max_query_len
+            common_attn_metadata.query_start_loc = (
+                saved_query_start_loc
+            )
+            common_attn_metadata.query_start_loc_cpu = (
+                saved_query_start_loc_cpu
+            )
+            common_attn_metadata._seq_lens_cpu = saved_seq_lens_cpu
+            common_attn_metadata._num_computed_tokens_cpu = (
+                saved_num_computed_tokens_cpu
+            )
+
+            for b in group:
+                req_id = self._request_ids[b["req_idx"]]
+                cache = self._get_or_create_cache(req_id)
+                draft_tokens = branch_result[b["req_idx"]].tolist()
+                cache.store_branch(b["cache_key"], draft_tokens)
+
+    # ------------------------------------------------------------------
+    # Batched branch generation (fast path)
+    # ------------------------------------------------------------------
+
+    def _batched_branch_generate(
+        self,
+        branches: list[dict],
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> None:
+        """Generate draft tokens for all branches in a single batched
+        set of draft model forwards.
+
+        Instead of calling self._underlying.propose() N times (one per
+        branch), this method:
+        1. Expands the batch to treat each branch as a virtual request
+        2. Runs one first-forward (prefill) for all branches
+        3. Runs num_spec-1 decode forwards for all branches
+        4. Stores results in per-request caches
+
+        All branches of the same request share the same KV cache block
+        table (race condition on writes is acceptable since branch
+        results are stored in the reuse cache, not used directly).
+        """
+        eagle = self._underlying
+        device = eagle.device
+        num_branches = len(branches)
+        num_spec = eagle.num_speculative_tokens
+
+        # Handle eagle3 hidden state combination
+        if eagle.method == "eagle3":
+            from vllm.model_executor.models.llama_eagle3 import (
+                Eagle3LlamaForCausalLM,
+            )
+            assert isinstance(eagle.model, Eagle3LlamaForCausalLM)
+            target_hidden_states = eagle.model.combine_hidden_states(
+                target_hidden_states
+            )
+
+        # ----------------------------------------------------------
+        # Step 1: Build expanded tensors for the first forward
+        # ----------------------------------------------------------
+        total_tokens = sum(b["ql"] for b in branches)
+
+        # Pre-allocate expanded tensors
+        exp_input_ids = torch.empty(
+            total_tokens, dtype=torch.int32, device=device,
+        )
+        exp_positions = torch.empty(
+            total_tokens, dtype=torch.int64, device=device,
+        )
+        exp_hidden_states = torch.empty(
+            (total_tokens, eagle.hidden_size),
+            dtype=eagle.dtype, device=device,
+        )
+        exp_qsl = torch.zeros(
+            num_branches + 1, dtype=torch.int32, device=device,
+        )
+        exp_lti = torch.empty(
+            num_branches, dtype=torch.int64, device=device,
+        )
+        exp_seq_lens = torch.empty(
+            num_branches,
+            dtype=common_attn_metadata.seq_lens.dtype,
+            device=device,
+        )
+        exp_slot_mapping = torch.empty(
+            total_tokens,
+            dtype=common_attn_metadata.slot_mapping.dtype,
+            device=device,
+        )
+
+        # Map branch -> original request for block table replication
+        branch_req_indices = torch.empty(
+            num_branches, dtype=torch.long, device=device,
+        )
+
+        offset = 0
+        for b_idx, branch in enumerate(branches):
+            qs = branch["qs"]
+            ql = branch["ql"]
+            pos = branch["pos"]
+
+            # Shift input_ids by 1 (same as EagleProposer):
+            # input_ids[:-1] = target_token_ids[1:]
+            # input_ids[last_token_index] = root_token
+            if ql > 1:
+                exp_input_ids[offset:offset + ql - 1] = (
+                    target_token_ids[qs + 1:qs + ql]
+                )
+            # Fill the last position (not covered by shift).
+            # Must be a valid token to avoid out-of-range embedding.
+            exp_input_ids[offset + ql - 1] = (
+                target_token_ids[qs + ql - 1]
+            )
+            # Set the root token at the branch position
+            exp_input_ids[offset + pos] = branch["root_token"]
+
+            # Copy positions and hidden_states from original request
+            exp_positions[offset:offset + ql] = (
+                target_positions[qs:qs + ql]
+            )
+            exp_hidden_states[offset:offset + ql] = (
+                target_hidden_states[qs:qs + ql]
+            )
+
+            # Copy slot_mapping from original request
+            exp_slot_mapping[offset:offset + ql] = (
+                common_attn_metadata.slot_mapping[qs:qs + ql]
+            )
+
+            # Set per-branch metadata
+            exp_qsl[b_idx + 1] = offset + ql
+            exp_lti[b_idx] = offset + pos
+            exp_seq_lens[b_idx] = (
+                common_attn_metadata.seq_lens[branch["req_idx"]]
+            )
+            branch_req_indices[b_idx] = branch["req_idx"]
+
+            offset += ql
+
+        # Replicate block table rows for branches
+        exp_block_table = (
+            common_attn_metadata.block_table_tensor[branch_req_indices]
+        )
+
+        # Build expanded CommonAttentionMetadata
+        exp_qsl_cpu = exp_qsl.cpu()
+        exp_cam = CommonAttentionMetadata(
+            query_start_loc=exp_qsl,
+            seq_lens=exp_seq_lens,
+            query_start_loc_cpu=exp_qsl_cpu,
+            _seq_lens_cpu=None,
+            _num_computed_tokens_cpu=None,
+            num_reqs=num_branches,
+            num_actual_tokens=total_tokens,
+            max_query_len=max(b["ql"] for b in branches),
+            max_seq_len=int(exp_seq_lens.max().item()),
+            block_table_tensor=exp_block_table,
+            slot_mapping=exp_slot_mapping,
+            causal=True,
+        )
+
+        # ----------------------------------------------------------
+        # Step 2: Run the first forward (prefill-like)
+        # ----------------------------------------------------------
+        if eagle.attn_metadata_builder is None:
+            attn_metadata_builder = eagle._get_attention_metadata_builder()
+        else:
+            attn_metadata_builder = eagle.attn_metadata_builder
+
+        attn_metadata = attn_metadata_builder.build_for_drafting(
+            common_attn_metadata=exp_cam, draft_index=0,
+        )
+        per_layer_attn_metadata = {
+            name: attn_metadata for name in eagle.attn_layer_names
+        }
+        # Handle indexer layers if present
+        if eagle.draft_indexer_metadata_builder:
+            draft_indexer_md = (
+                eagle.draft_indexer_metadata_builder.build_for_drafting(
+                    common_attn_metadata=exp_cam, draft_index=0,
+                )
+            )
+            for name in eagle.indexer_layer_names:
+                per_layer_attn_metadata[name] = draft_indexer_md
+
+        # Copy to eagle's persistent buffers
+        eagle.input_ids[:total_tokens] = exp_input_ids
+        eagle._set_positions(total_tokens, exp_positions)
+        eagle.hidden_states[:total_tokens] = exp_hidden_states
+
+        input_ids_arg = eagle.input_ids[:total_tokens]
+        inputs_embeds_arg = None
+        if eagle.supports_mm_inputs:
+            eagle.inputs_embeds[:total_tokens] = (
+                eagle.model.embed_input_ids(input_ids_arg)
+            )
+            input_ids_arg = None
+            inputs_embeds_arg = eagle.inputs_embeds[:total_tokens]
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            eagle.vllm_config,
+            num_tokens=total_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        ):
+            ret_hs = eagle.model(
+                input_ids=input_ids_arg,
+                positions=eagle._get_positions(total_tokens),
+                hidden_states=eagle.hidden_states[:total_tokens],
+                inputs_embeds=inputs_embeds_arg,
+            )
+            if eagle.method == "mtp":
+                last_hs = ret_hs
+                hs = last_hs
+            else:
+                last_hs, hs = ret_hs
+
+        # Extract hidden states at branch positions
+        sample_hs = last_hs[exp_lti]
+        logits = eagle.model.compute_logits(sample_hs)
+
+        # Early exit for single draft token
+        if num_spec == 1:
+            draft_ids = logits.argmax(dim=-1).view(-1, 1)
+            self._store_batched_results(branches, draft_ids)
+            return
+
+        # Prepare for subsequent decode-style forwards
+        positions = exp_positions[exp_lti]
+        if eagle.method in (
+            "deepseek_mtp", "ernie_mtp",
+            "longcat_flash_mtp", "pangu_ultra_moe_mtp",
+        ):
+            hs = eagle.hidden_states[exp_lti]
+        else:
+            hs = hs[exp_lti]
+
+        draft_ids = logits.argmax(dim=-1)
+        draft_ids_list = [draft_ids]
+
+        # ----------------------------------------------------------
+        # Step 3: Update metadata for decode-style forwards
+        # ----------------------------------------------------------
+        exp_cam.num_actual_tokens = num_branches
+        exp_cam.max_query_len = 1
+        exp_cam.query_start_loc = eagle.arange[:num_branches + 1]
+        exp_cam.query_start_loc_cpu = torch.from_numpy(
+            np.arange(num_branches + 1, dtype=np.int32)
+        )
+
+        # Apply num_rejected_tokens_gpu adjustment (same as
+        # EagleProposer does after first forward).
+        if num_spec > 1 and num_rejected_tokens_gpu is not None:
+            exp_rejected = num_rejected_tokens_gpu[branch_req_indices]
+            exp_cam.seq_lens -= exp_rejected
+        exp_cam._seq_lens_cpu = None
+        exp_cam._num_computed_tokens_cpu = None
+
+        # ----------------------------------------------------------
+        # Step 4: Generate remaining draft tokens
+        # ----------------------------------------------------------
+        block_size = attn_metadata_builder.kv_cache_spec.block_size
+
+        for token_index in range(num_spec - 1):
+            input_ids = draft_ids_list[-1].int()
+            positions += 1
+            exceeds = positions >= eagle.max_model_len
+            clamped_pos = torch.where(exceeds, 0, positions)
+
+            exp_cam.seq_lens += 1
+            exp_cam.seq_lens.masked_fill_(exceeds, 1)
+            if exp_cam._seq_lens_cpu is not None:
+                exp_cam._seq_lens_cpu += 1
+            if exp_cam._num_computed_tokens_cpu is not None:
+                exp_cam._num_computed_tokens_cpu += 1
+
+            # Compute slot mapping for new positions
+            block_numbers = clamped_pos // block_size
+            block_ids = exp_cam.block_table_tensor.gather(
+                dim=1, index=block_numbers.view(-1, 1),
+            ).view(-1)
+            exp_cam.slot_mapping = (
+                block_ids * block_size + clamped_pos % block_size
+            )
+            exp_cam.slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
+
+            # Build attention metadata
+            attn_metadata = attn_metadata_builder.build_for_drafting(
+                common_attn_metadata=exp_cam,
+                draft_index=token_index + 1,
+            )
+            per_layer_attn_metadata = {
+                name: attn_metadata
+                for name in eagle.attn_layer_names
+            }
+
+            # Copy to eagle buffers
+            eagle.input_ids[:num_branches] = input_ids
+            eagle._set_positions(num_branches, clamped_pos)
+            eagle.hidden_states[:num_branches] = hs
+
+            input_ids_arg = eagle.input_ids[:num_branches]
+            inputs_embeds_arg = None
+            if eagle.supports_mm_inputs:
+                eagle.inputs_embeds[:num_branches] = (
+                    eagle.model.embed_input_ids(input_ids_arg)
+                )
+                input_ids_arg = None
+                inputs_embeds_arg = (
+                    eagle.inputs_embeds[:num_branches]
+                )
+
+            with set_forward_context(
+                per_layer_attn_metadata,
+                eagle.vllm_config,
+                num_tokens=num_branches,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            ):
+                ret_hs = eagle.model(
+                    input_ids=input_ids_arg,
+                    positions=eagle._get_positions(num_branches),
+                    hidden_states=eagle.hidden_states[:num_branches],
+                    inputs_embeds=inputs_embeds_arg,
+                )
+                if eagle.method == "mtp":
+                    last_hs = ret_hs
+                    hs = ret_hs
+                else:
+                    last_hs, hs = ret_hs
+
+            hs = hs[:num_branches]
+            logits = eagle.model.compute_logits(last_hs[:num_branches])
+            draft_ids = logits.argmax(dim=-1)
+            draft_ids_list.append(draft_ids)
+
+        # [num_branches, num_speculative_tokens]
+        all_draft_ids = torch.stack(draft_ids_list, dim=1)
+        self._store_batched_results(branches, all_draft_ids)
+
+    def _store_batched_results(
+        self,
+        branches: list[dict],
+        all_draft_ids: torch.Tensor,
+    ) -> None:
+        """Store batched branch generation results into per-request caches."""
+        for b_idx, branch in enumerate(branches):
+            req_id = self._request_ids[branch["req_idx"]]
+            cache = self._get_or_create_cache(req_id)
+            draft_tokens = all_draft_ids[b_idx].tolist()
+            cache.store_branch(branch["cache_key"], draft_tokens)
 
     # ------------------------------------------------------------------
     # Statistics

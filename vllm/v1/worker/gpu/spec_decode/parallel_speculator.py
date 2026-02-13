@@ -681,10 +681,10 @@ class ParallelSpeculator:
         num_reqs = input_batch.num_reqs
 
         # --------------------------------------------------------------
-        # Phase 4: Generate branches for CURRENT round
-        # (Must run first so cache is populated before lookup)
-        # Uses early exit hidden states (if configured) for root token
-        # computation; fallback propose still uses last_hidden_states.
+        # Phase 4: Generate branches for current round (populate cache)
+        # Must run BEFORE cache lookup because both branch keys and
+        # lookup keys reference the SAME draft tokens (current round's
+        # input_ids being verified by the target model).
         # --------------------------------------------------------------
         early_hs = self.get_early_exit_hidden_states()
         branch_hs = early_hs if early_hs is not None else all_hidden_states
@@ -703,9 +703,7 @@ class ParallelSpeculator:
         )
 
         # --------------------------------------------------------------
-        # Phase 1: Cache Lookup (in the CURRENT round's cache)
-        # Now that branches are generated and stored, lookup by
-        # sampled_token_ids finds matching branches from this round.
+        # Phase 1: Cache Lookup (in current round's cache)
         # --------------------------------------------------------------
         cache_hits: dict[int, list[int]] = {}
         if sampled_token_ids is not None:
@@ -734,7 +732,7 @@ class ParallelSpeculator:
 
         # --------------------------------------------------------------
         # Phase 2: Fallback — standard eagle propose
-        # (Runs last to leave correct eagle KV cache state)
+        # (Runs to maintain correct eagle KV cache state)
         # --------------------------------------------------------------
         fallback_result = self._underlying.propose(
             input_batch=input_batch,
