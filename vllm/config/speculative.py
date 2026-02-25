@@ -168,6 +168,11 @@ class SpeculativeConfig:
     parallel_enable_concurrent: bool = False
     """Enable concurrent execution of draft model on a separate CUDA
     stream while the target model continues processing."""
+    parallel_draft_device: str | None = None
+    """Device for a second Eagle model used for cross-device branch
+    generation (e.g. 'cuda:1'). When set, a remote Eagle model is
+    loaded on this device and branch generation runs truly in parallel
+    with the target model forward on GPU 0."""
 
     def compute_hash(self) -> str:
         """
@@ -658,15 +663,33 @@ class SpeculativeConfig:
         # Restore original method
         self.method = original_method
 
+        # Validate parallel_draft_device
+        if self.parallel_draft_device is not None:
+            import torch
+            if not self.parallel_draft_device.startswith("cuda"):
+                raise ValueError(
+                    f"parallel_draft_device must be a CUDA device, "
+                    f"got '{self.parallel_draft_device}'"
+                )
+            # Enable concurrent automatically when cross-device is used
+            if not self.parallel_enable_concurrent:
+                logger.info(
+                    "Enabling concurrent mode automatically for "
+                    "cross-device parallel-SD (draft_device=%s)",
+                    self.parallel_draft_device,
+                )
+                self.parallel_enable_concurrent = True
+
         logger.info(
             "Parallel speculative decoding configured: "
             "draft_method=%s, top_k=%d, half_cache_hit=%s, "
-            "early_exit_layer=%d, concurrent=%s",
+            "early_exit_layer=%d, concurrent=%s, draft_device=%s",
             self.parallel_draft_method,
             self.parallel_top_k,
             self.parallel_enable_half_cache_hit,
             self.parallel_early_exit_layer,
             self.parallel_enable_concurrent,
+            self.parallel_draft_device,
         )
 
     def _validate_suffix_decoding(self):

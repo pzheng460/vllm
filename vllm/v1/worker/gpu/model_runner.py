@@ -937,6 +937,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.prepare_dummy_attn_metadata(input_batch)
             sampling_metadata = None
 
+        # Store batch state for async branch generation (Parallel-SD).
+        # Must happen before target forward so the early exit hook can
+        # launch standard branches concurrently.
+        if (self.do_spec_decode
+                and hasattr(self.speculator, 'store_batch_state')
+                and sampling_metadata is not None):
+            last_sampled = self.req_states.last_sampled_tokens[
+                input_batch.idx_mapping
+            ]
+            next_prefill = self.req_states.next_prefill_tokens[
+                input_batch.idx_mapping
+            ]
+            self.speculator.store_batch_state(
+                input_batch, sampling_metadata,
+                last_sampled, next_prefill,
+            )
+
         # Run model.
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Run CUDA graph.
@@ -963,6 +980,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     input_ids=input_batch.input_ids,
                     positions=positions,
                 )
+
+        # Strategy A: launch async standard branch gen after target forward.
+        # No-op if already launched by early exit hook (Strategy B).
+        if (self.do_spec_decode
+                and hasattr(self.speculator,
+                            'launch_standard_branches_if_not_started')):
+            self.speculator.launch_standard_branches_if_not_started(
+                hidden_states
+            )
 
         self.execute_model_state = hidden_states, input_batch, sampling_metadata
         return None

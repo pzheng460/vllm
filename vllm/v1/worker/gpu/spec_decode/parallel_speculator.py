@@ -80,10 +80,16 @@ class ParallelSpeculator:
         self._early_exit_hook_handle = None
         self._early_exit_hidden_states: torch.Tensor | None = None
 
-        # Concurrent execution support
+        # CUDA stream for async branch generation (always created on CUDA)
         self._draft_stream: torch.cuda.Stream | None = None
-        if self.enable_concurrent and device.type == "cuda":
+        if device.type == "cuda":
             self._draft_stream = torch.cuda.Stream(device=device)
+
+        # Pre-computed async branch state
+        self._stored_batch_state: dict | None = None
+        self._standard_branches_launched: bool = False
+        self._standard_branches_done: bool = False
+        self._request_infos: list[dict | None] = []
 
         logger.info(
             "ParallelSpeculator initialized: draft_method=%s, top_k=%d, "
@@ -198,7 +204,16 @@ class ParallelSpeculator:
                 hidden_states = output[0]
             else:
                 hidden_states = output
-            self._early_exit_hidden_states = hidden_states.detach()
+            hs = hidden_states.detach()
+            self._early_exit_hidden_states = hs
+
+            # Strategy B: Launch standard branch gen on draft stream
+            if (self._draft_stream is not None
+                    and self._stored_batch_state is not None
+                    and not self._standard_branches_launched):
+                self._launch_async_standard_branch_gen(
+                    hs, is_early_exit=True,
+                )
 
         # Remove previous hook if exists
         if self._early_exit_hook_handle is not None:
@@ -252,6 +267,97 @@ class ParallelSpeculator:
         """
         if self._draft_stream is not None:
             self._draft_stream.synchronize()
+
+    # ------------------------------------------------------------------
+    # Async branch generation (CUDA stream pipeline)
+    # ------------------------------------------------------------------
+
+    def store_batch_state(
+        self,
+        input_batch: InputBatch,
+        sampling_metadata: SamplingMetadata,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+    ) -> None:
+        """Store pre-forward batch state for async branch generation.
+
+        Must be called before the target model forward pass so that
+        the early exit hook or post-forward launch can use this state.
+        Only active when enable_concurrent is True.
+        """
+        if not self.enable_concurrent:
+            return
+
+        self._stored_batch_state = {
+            'input_batch': input_batch,
+            'sampling_metadata': sampling_metadata,
+            'last_sampled': last_sampled.clone(),
+            'next_prefill_tokens': next_prefill_tokens.clone(),
+        }
+        self._standard_branches_launched = False
+        self._standard_branches_done = False
+
+    def _launch_async_standard_branch_gen(
+        self,
+        hidden_states: torch.Tensor,
+        is_early_exit: bool = False,
+    ) -> None:
+        """Launch standard branch generation on the draft CUDA stream.
+
+        Runs synchronously on the calling thread but enqueues GPU work
+        on the draft stream. Note: CPU-GPU sync points (.item(), .tolist())
+        in branch gen will block the calling thread, limiting overlap
+        with the target forward.
+
+        Args:
+            hidden_states: Hidden states for root token computation and
+                eagle model input (early exit or full forward).
+            is_early_exit: True if hidden_states come from early exit hook.
+        """
+        self._standard_branches_launched = True
+        state = self._stored_batch_state
+        if state is None:
+            return
+
+        default_stream = torch.cuda.current_stream()
+
+        try:
+            with torch.cuda.stream(self._draft_stream):
+                self._draft_stream.wait_stream(default_stream)
+                self._generate_standard_branches(
+                    input_batch=state['input_batch'],
+                    sampling_metadata=state['sampling_metadata'],
+                    all_hidden_states=hidden_states,
+                    last_sampled=state['last_sampled'],
+                    next_prefill_tokens=state['next_prefill_tokens'],
+                )
+        except Exception as e:
+            logger.warning("Async branch gen failed: %s", e)
+            return
+
+        self._standard_branches_done = True
+
+    def launch_standard_branches_if_not_started(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """Strategy A: launch async branch gen after target forward.
+
+        Called from model_runner after the target forward completes.
+        No-op if already launched by the early exit hook (Strategy B).
+
+        Args:
+            hidden_states: Full target model hidden states.
+        """
+        if self._standard_branches_launched:
+            return  # Already launched by early exit hook
+        if self._draft_stream is None or self._stored_batch_state is None:
+            return
+        if self._passthrough:
+            return
+        self._launch_async_standard_branch_gen(
+            hidden_states, is_early_exit=False,
+        )
 
     # ------------------------------------------------------------------
     # Pass-through properties from underlying speculator
@@ -436,69 +542,49 @@ class ParallelSpeculator:
                 num_tokens = 1
         return num_tokens <= 1
 
-    def _generate_branches_for_next_round(
+    def _analyze_requests(
         self,
         input_batch: InputBatch,
-        sampling_metadata: SamplingMetadata,
-        last_hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
-        all_hidden_states: torch.Tensor,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-        sampled_token_ids: torch.Tensor | None,
-    ) -> None:
-        """Generate all branch continuations and store in per-request caches.
+        num_sampled: torch.Tensor | None = None,
+        sampled_token_ids: torch.Tensor | None = None,
+    ) -> list[dict | None]:
+        """Analyze requests to determine PREFILL/DECODE mode and positions.
 
-        For each request, determines PREFILL vs DECODE mode and generates
-        branches at appropriate positions by calling the underlying eagle
-        speculator with modified num_rejected / last_sampled tensors.
+        When num_sampled is available (post-scoring), uses it to skip
+        chunked prefill requests. Otherwise uses query length heuristics.
 
-        Branch results are stored in per-request ReuseCache instances
-        for lookup in the next round's Phase 1.
+        Returns:
+            Per-request info dicts (or None for skipped requests).
         """
-        if self._target_lm_head is None:
-            return  # Can't compute root tokens without lm_head
-
         num_reqs = input_batch.num_reqs
         query_start_loc_np = input_batch.query_start_loc_np
-
-        # Clear all per-request caches for a fresh round
-        for i in range(num_reqs):
-            cache = self._get_or_create_cache(input_batch.req_ids[i])
-            cache.clear()
-
-        # Analyze each request: determine mode and branch positions
         request_infos: list[dict | None] = []
-        for i in range(num_reqs):
-            ns = num_sampled[i].item()
-            if ns == 0:
-                # Chunked prefill, not yet complete — skip
-                request_infos.append(None)
-                continue
 
+        for i in range(num_reqs):
             qs = int(query_start_loc_np[i])
             qe = int(query_start_loc_np[i + 1])
             ql = qe - qs
 
-            # Per-request PREFILL vs DECODE detection
-            if (sampled_token_ids is None
-                    or sampled_token_ids.dim() == 1
-                    or sampled_token_ids.shape[1] <= 1):
-                is_prefill = True
-            else:
-                valid = int((sampled_token_ids[i] != -1).sum().item())
-                is_prefill = (valid <= 1)
+            if ql == 0:
+                request_infos.append(None)
+                continue
+
+            # Skip chunked prefill if num_sampled is available
+            if num_sampled is not None:
+                ns = num_sampled[i].item()
+                if ns == 0:
+                    request_infos.append(None)
+                    continue
+
+            # PREFILL vs DECODE detection by query length
+            is_prefill = ql > self.num_speculative_tokens + 1
 
             # Get input_ids for cache key construction
             req_input_ids = input_batch.input_ids[qs:qe].tolist()
 
             if is_prefill:
-                # PREFILL: only branch at the last position
                 branch_positions = [ql - 1]
             else:
-                # DECODE: branch at all positions (up to num_spec + 1)
                 max_pos = min(ql, self.num_speculative_tokens + 1)
                 branch_positions = list(range(max_pos))
 
@@ -510,7 +596,46 @@ class ParallelSpeculator:
                 'branch_positions': branch_positions,
             })
 
-        # Find max number of branch positions across all requests
+        return request_infos
+
+    def _generate_standard_branches(
+        self,
+        input_batch: InputBatch,
+        sampling_metadata: SamplingMetadata,
+        all_hidden_states: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        propose_hidden_states: torch.Tensor | None = None,
+    ) -> None:
+        """Generate standard branch continuations and store in caches.
+
+        Does NOT need scoring results (num_sampled, num_rejected,
+        sampled_token_ids). Uses query length for PREFILL/DECODE
+        detection and constructs its own num_sampled/num_rejected.
+
+        Stores request_infos in self._request_infos for use by
+        _generate_targeted_branches().
+
+        Args:
+            all_hidden_states: Hidden states for root token computation.
+            propose_hidden_states: Hidden states for eagle propose call.
+                Defaults to all_hidden_states if not provided.
+        """
+        if self._target_lm_head is None:
+            return
+
+        num_reqs = input_batch.num_reqs
+
+        # Clear all per-request caches for a fresh round
+        for i in range(num_reqs):
+            cache = self._get_or_create_cache(input_batch.req_ids[i])
+            cache.clear()
+
+        # Analyze requests (without scoring results)
+        request_infos = self._analyze_requests(input_batch)
+        self._request_infos = request_infos
+
+        # Find max branch positions
         max_branch_pos = 0
         for info in request_infos:
             if info is not None:
@@ -521,9 +646,10 @@ class ParallelSpeculator:
         if max_branch_pos == 0:
             return
 
-        # Pre-compute root tokens (batched) for each position index
-        # root_tokens_per_pos[pos_idx] = (active_req_indices, top_k_ids)
-        root_tokens_per_pos: list[tuple[list[int], torch.Tensor] | None] = []
+        # Pre-compute root tokens (batched) per position
+        root_tokens_per_pos: list[
+            tuple[list[int], torch.Tensor] | None
+        ] = []
         for pos_idx in range(max_branch_pos):
             hs_indices: list[int] = []
             active_reqs: list[int] = []
@@ -544,8 +670,24 @@ class ParallelSpeculator:
             )
             root_tokens_per_pos.append((active_reqs, top_k_ids))
 
-        # For each (pos_idx, k_idx): build modified tensors, call propose,
-        # and store the resulting draft tokens in per-request caches.
+        # Determine hidden states for eagle propose call
+        propose_hs = (
+            propose_hidden_states
+            if propose_hidden_states is not None
+            else all_hidden_states
+        )
+
+        # Construct default num_sampled/num_rejected (safe defaults for
+        # non-branching requests; branching requests override per-branch).
+        default_num_sampled = torch.ones(
+            num_reqs, dtype=torch.int32, device=self.device,
+        )
+        default_num_rejected = torch.zeros(
+            num_reqs, dtype=torch.int32, device=self.device,
+        )
+
+        # Generate branches: for each (pos_idx, k_idx), build modified
+        # tensors, call underlying propose, store results.
         for pos_idx in range(max_branch_pos):
             rt_info = root_tokens_per_pos[pos_idx]
             if rt_info is None:
@@ -553,10 +695,9 @@ class ParallelSpeculator:
             active_reqs, top_k_ids = rt_info
 
             for k_idx in range(self.top_k):
-                # Clone tensors so we can modify per-request values
-                branch_num_rejected = num_rejected.clone()
+                branch_num_rejected = default_num_rejected.clone()
                 branch_last_sampled = last_sampled.clone()
-                branch_num_sampled = num_sampled.clone()
+                branch_num_sampled = default_num_sampled.clone()
 
                 branch_keys: list[tuple[int, tuple[int, ...]]] = []
 
@@ -566,19 +707,15 @@ class ParallelSpeculator:
                     root_token = top_k_ids[j, k_idx].item()
 
                     if info['is_prefill']:
-                        # Force use of last_sampled, process full query
                         branch_num_sampled[req_idx] = 1
                         branch_num_rejected[req_idx] = 0
                     else:
-                        # Truncate query to position p+1
                         branch_num_rejected[req_idx] = (
                             info['ql'] - (pos + 1)
                         )
 
-                    # Set root token as the last_sampled for this request
                     branch_last_sampled[req_idx] = root_token
 
-                    # Build cache key
                     if info['is_prefill']:
                         key = (root_token,)
                     else:
@@ -590,19 +727,17 @@ class ParallelSpeculator:
                 if not branch_keys:
                     continue
 
-                # Call underlying propose with modified parameters
                 branch_result = self._underlying.propose(
                     input_batch=input_batch,
                     sampling_metadata=sampling_metadata,
-                    last_hidden_states=last_hidden_states,
-                    aux_hidden_states=aux_hidden_states,
+                    last_hidden_states=propose_hs,
+                    aux_hidden_states=None,
                     num_sampled=branch_num_sampled,
                     num_rejected=branch_num_rejected,
                     last_sampled=branch_last_sampled,
                     next_prefill_tokens=next_prefill_tokens,
-                ).clone()  # Clone: propose returns view of internal buffer
+                ).clone()
 
-                # Store draft tokens in per-request caches
                 for req_idx, key in branch_keys:
                     req_id = input_batch.req_ids[req_idx]
                     cache = self._get_or_create_cache(req_id)
@@ -610,9 +745,133 @@ class ParallelSpeculator:
                     cache.store_branch(key, draft_tokens)
 
         logger.debug(
-            "Branch generation complete: num_reqs=%d, max_pos=%d, "
-            "top_k=%d",
+            "Standard branch gen: num_reqs=%d, max_pos=%d, top_k=%d",
             num_reqs, max_branch_pos, self.top_k,
+        )
+
+    def _generate_targeted_branches(
+        self,
+        input_batch: InputBatch,
+        sampling_metadata: SamplingMetadata,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor | None,
+    ) -> None:
+        """Generate targeted branches (guaranteed cache hit).
+
+        For each request, adds a branch whose root_token = correction_token
+        at the matching position. Needs scoring results (last_sampled with
+        correction token, sampled_token_ids, num_sampled, num_rejected).
+
+        Uses request_infos stored by _generate_standard_branches().
+        """
+        if sampled_token_ids is None:
+            return
+
+        request_infos = self._request_infos
+        if not request_infos:
+            return
+
+        num_reqs = input_batch.num_reqs
+        targeted_keys: list[tuple[int, tuple[int, ...]]] = []
+        branch_num_rejected_t = num_rejected.clone()
+        branch_last_sampled_t = last_sampled.clone()
+        branch_num_sampled_t = num_sampled.clone()
+
+        for i in range(num_reqs):
+            if i >= len(request_infos):
+                continue
+            info = request_infos[i]
+            if info is None:
+                continue
+
+            correction_token = last_sampled[i].item()
+
+            if info['is_prefill']:
+                matching_pos = info['ql'] - 1
+                key = (correction_token,)
+                branch_num_sampled_t[i] = 1
+                branch_num_rejected_t[i] = 0
+            else:
+                n = int(num_sampled[i].item())
+                if n <= 0:
+                    continue
+                if sampled_token_ids.dim() == 1:
+                    tokens = [sampled_token_ids[i].item()]
+                else:
+                    tokens = sampled_token_ids[i, :n].tolist()
+                matching_pos = len(tokens) - 1
+                key = tuple(tokens)
+                branch_num_rejected_t[i] = (
+                    info['ql'] - (matching_pos + 1)
+                )
+
+            # Check if already covered by standard branches
+            req_id = input_batch.req_ids[i]
+            cache = self._reuse_caches.get(req_id)
+            if cache is not None and key in cache._cache:
+                continue
+
+            targeted_keys.append((i, key))
+
+        if targeted_keys:
+            targeted_result = self._underlying.propose(
+                input_batch=input_batch,
+                sampling_metadata=sampling_metadata,
+                last_hidden_states=last_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                num_sampled=branch_num_sampled_t,
+                num_rejected=branch_num_rejected_t,
+                last_sampled=branch_last_sampled_t,
+                next_prefill_tokens=next_prefill_tokens,
+            ).clone()
+
+            for req_idx, key in targeted_keys:
+                req_id = input_batch.req_ids[req_idx]
+                cache = self._get_or_create_cache(req_id)
+                draft_tokens = targeted_result[req_idx].tolist()
+                cache.store_branch(key, draft_tokens)
+
+    def _generate_branches_for_next_round(
+        self,
+        input_batch: InputBatch,
+        sampling_metadata: SamplingMetadata,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        all_hidden_states: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        sampled_token_ids: torch.Tensor | None,
+    ) -> None:
+        """Generate all branch continuations (synchronous fallback).
+
+        Calls both standard and targeted branch generation in sequence.
+        Used when async branch gen was not launched.
+        """
+        self._generate_standard_branches(
+            input_batch=input_batch,
+            sampling_metadata=sampling_metadata,
+            all_hidden_states=all_hidden_states,
+            last_sampled=last_sampled,
+            next_prefill_tokens=next_prefill_tokens,
+            propose_hidden_states=last_hidden_states,
+        )
+        self._generate_targeted_branches(
+            input_batch=input_batch,
+            sampling_metadata=sampling_metadata,
+            last_hidden_states=last_hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            last_sampled=last_sampled,
+            next_prefill_tokens=next_prefill_tokens,
+            sampled_token_ids=sampled_token_ids,
         )
 
     # ------------------------------------------------------------------
@@ -663,6 +922,7 @@ class ParallelSpeculator:
 
         # Pass-through mode: delegate to underlying speculator
         if self._passthrough or all_hidden_states is None:
+            self._stored_batch_state = None
             result = self._underlying.propose(
                 input_batch=input_batch,
                 sampling_metadata=sampling_metadata,
@@ -682,25 +942,53 @@ class ParallelSpeculator:
 
         # --------------------------------------------------------------
         # Phase 4: Generate branches for current round (populate cache)
-        # Must run BEFORE cache lookup because both branch keys and
-        # lookup keys reference the SAME draft tokens (current round's
-        # input_ids being verified by the target model).
+        # Standard branches may have been pre-computed asynchronously
+        # in a background thread. Only targeted branches (which need
+        # correction_token from scoring) are run synchronously here.
         # --------------------------------------------------------------
-        early_hs = self.get_early_exit_hidden_states()
-        branch_hs = early_hs if early_hs is not None else all_hidden_states
+        async_ok = False
+        if (self._standard_branches_launched
+                and self._standard_branches_done):
+            # Synchronize the draft CUDA stream
+            if self._draft_stream is not None:
+                self._draft_stream.synchronize()
+            async_ok = True
+            self._standard_branches_done = False
+            self._standard_branches_launched = False
+            self._stored_batch_state = None
 
-        self._generate_branches_for_next_round(
-            input_batch=input_batch,
-            sampling_metadata=sampling_metadata,
-            last_hidden_states=last_hidden_states,
-            aux_hidden_states=aux_hidden_states,
-            all_hidden_states=branch_hs,
-            num_sampled=num_sampled,
-            num_rejected=num_rejected,
-            last_sampled=last_sampled,
-            next_prefill_tokens=next_prefill_tokens,
-            sampled_token_ids=sampled_token_ids,
-        )
+        if async_ok:
+            self._generate_targeted_branches(
+                input_batch=input_batch,
+                sampling_metadata=sampling_metadata,
+                last_hidden_states=last_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                sampled_token_ids=sampled_token_ids,
+            )
+        else:
+            # No async branches — run full synchronous branch gen
+            self._stored_batch_state = None
+            early_hs = self.get_early_exit_hidden_states()
+            branch_hs = (
+                early_hs if early_hs is not None else all_hidden_states
+            )
+
+            self._generate_branches_for_next_round(
+                input_batch=input_batch,
+                sampling_metadata=sampling_metadata,
+                last_hidden_states=last_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                all_hidden_states=branch_hs,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                sampled_token_ids=sampled_token_ids,
+            )
 
         # --------------------------------------------------------------
         # Phase 1: Cache Lookup (in current round's cache)
@@ -731,27 +1019,34 @@ class ParallelSpeculator:
                     cache_hits[i] = hit
 
         # --------------------------------------------------------------
-        # Phase 2: Fallback — standard eagle propose
-        # (Runs to maintain correct eagle KV cache state)
+        # Phase 2 & 3: Skip fallback when all requests have cache hits
         # --------------------------------------------------------------
-        fallback_result = self._underlying.propose(
-            input_batch=input_batch,
-            sampling_metadata=sampling_metadata,
-            last_hidden_states=last_hidden_states,
-            aux_hidden_states=aux_hidden_states,
-            num_sampled=num_sampled,
-            num_rejected=num_rejected,
-            last_sampled=last_sampled,
-            next_prefill_tokens=next_prefill_tokens,
-        ).clone()  # MUST clone — returns VIEW of internal buffer
-
-        # --------------------------------------------------------------
-        # Phase 3: Merge cache hits into fallback result
-        # --------------------------------------------------------------
-        for req_idx, cached_tokens in cache_hits.items():
-            n = min(len(cached_tokens), fallback_result.shape[1])
-            for t in range(n):
-                fallback_result[req_idx, t] = cached_tokens[t]
+        if len(cache_hits) == num_reqs and num_reqs > 0:
+            # All cache hits — construct result directly, skip fallback
+            result = torch.zeros(
+                num_reqs, self._underlying.num_speculative_steps,
+                dtype=torch.int64, device=self.device,
+            )
+            for req_idx, cached_tokens in cache_hits.items():
+                n = min(len(cached_tokens), result.shape[1])
+                for t in range(n):
+                    result[req_idx, t] = cached_tokens[t]
+        else:
+            # Some misses — run fallback and merge cache hits
+            result = self._underlying.propose(
+                input_batch=input_batch,
+                sampling_metadata=sampling_metadata,
+                last_hidden_states=last_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+            ).clone()  # MUST clone — returns VIEW of internal buffer
+            for req_idx, cached_tokens in cache_hits.items():
+                n = min(len(cached_tokens), result.shape[1])
+                for t in range(n):
+                    result[req_idx, t] = cached_tokens[t]
 
         if cache_hits:
             logger.debug(
@@ -763,7 +1058,7 @@ class ParallelSpeculator:
         self._total_propose_time_ns += elapsed
         self._propose_count += 1
 
-        return fallback_result
+        return result
 
     # ------------------------------------------------------------------
     # Pass-through mode

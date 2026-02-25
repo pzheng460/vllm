@@ -3284,6 +3284,21 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        # Store batch state for async branch generation (Parallel-SD).
+        # Must happen before target forward so the early exit hook can
+        # launch standard branches concurrently.
+        if (self.speculative_config is not None
+                and spec_decode_common_attn_metadata is not None
+                and hasattr(self, 'drafter')
+                and hasattr(self.drafter, 'store_batch_state')):
+            self.drafter.store_batch_state(
+                target_token_ids=self.input_ids.gpu[:num_tokens_unpadded],
+                target_positions=self._get_positions(num_tokens_unpadded),
+                common_attn_metadata=spec_decode_common_attn_metadata,
+                sampling_metadata=self.input_batch.sampling_metadata,
+                request_ids=list(self.input_batch.req_ids[:num_reqs]),
+            )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -3315,6 +3330,16 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            # Strategy A: launch async standard branch gen after forward.
+            # No-op if already launched by early exit hook (Strategy B).
+            if (hasattr(self, 'drafter')
+                    and hasattr(self.drafter,
+                                'launch_standard_branches_if_not_started')
+                    and isinstance(hidden_states, torch.Tensor)):
+                self.drafter.launch_standard_branches_if_not_started(
+                    hidden_states
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.
