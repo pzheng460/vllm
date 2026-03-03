@@ -2006,12 +2006,16 @@ class ParallelProposer:
         batch_size: int,
         is_early_exit: bool = False,
         sampling_metadata: "SamplingMetadata | None" = None,
-    ) -> dict[int, list[int]]:
+    ) -> tuple[dict[int, list[int]], dict[int, torch.Tensor]]:
         """Compute MARS-optimized branch positions for DECODE requests.
 
         For each DECODE request, runs MARS dummy acceptance to find the
         first rejected position. Only that position is returned as the
         branch position, reducing the total number of branches.
+
+        Also returns root tokens at the branch position, reusing the
+        logits already computed for MARS (avoids a redundant
+        compute_logits call).
 
         PREFILL requests are skipped (they always branch at the last
         position, which is already the default).
@@ -2025,10 +2029,14 @@ class ParallelProposer:
             sampling_metadata: Sampling metadata for penalty application.
 
         Returns:
-            Dict mapping request index → [branch_position] for DECODE
-            requests. PREFILL requests are not included.
+            Tuple of:
+            - Dict mapping request index → [branch_position] for DECODE
+              requests. PREFILL requests are not included.
+            - Dict mapping request index → root token IDs tensor
+              [top_k] at the branch position (reused from MARS logits).
         """
         mars_positions: dict[int, list[int]] = {}
+        mars_root_tokens: dict[int, torch.Tensor] = {}
 
         qsl = common_attn_metadata.query_start_loc
         if qsl.device.type != "cpu":
@@ -2067,9 +2075,12 @@ class ParallelProposer:
             num_verify_positions = len(draft_tokens)
             hs_indices = [qs + p for p in range(num_verify_positions)]
 
-            # Compute top-2 logits at each verification position
-            top_2_ids, top_2_values = self._compute_root_tokens(
-                branch_hidden_states, hs_indices, top_k=2,
+            # Compute top-k logits at each verification position.
+            # Use max(top_k, 2) so we always have top-2 for MARS ratios,
+            # and top-k for root token extraction at the branch position.
+            k_for_topk = max(self.top_k, 2)
+            top_k_ids, top_k_values = self._compute_root_tokens(
+                branch_hidden_states, hs_indices, top_k=k_for_topk,
                 is_early_exit=is_early_exit,
                 sampling_metadata=sampling_metadata,
                 active_reqs=[i] * num_verify_positions,
@@ -2077,12 +2088,12 @@ class ParallelProposer:
             )
 
             # Extract top-1/top-2 tokens and compute logit ratios
-            top1_tokens = top_2_ids[:, 0].tolist()
-            top2_tokens = top_2_ids[:, 1].tolist()
+            top1_tokens = top_k_ids[:, 0].tolist()
+            top2_tokens = top_k_ids[:, 1].tolist()
 
             # Compute ratio r_i = z_2 / z_1 (avoid division by zero)
-            z1 = top_2_values[:, 0]  # top-1 logit values
-            z2 = top_2_values[:, 1]  # top-2 logit values
+            z1 = top_k_values[:, 0]  # top-1 logit values
+            z2 = top_k_values[:, 1]  # top-2 logit values
             # When z1 is zero or negative, ratio is 0 (reject tie case)
             ratios = torch.where(
                 z1 > 0, z2 / z1, torch.zeros_like(z1),
@@ -2100,6 +2111,13 @@ class ParallelProposer:
 
             mars_positions[i] = [branch_pos]
 
+            # Extract root tokens at the branch position from the
+            # already-computed logits (avoids a second compute_logits).
+            # Clamp index to valid tensor range (branch_pos can equal
+            # num_verify_positions when all tokens are accepted).
+            root_idx = min(branch_pos, num_verify_positions - 1)
+            mars_root_tokens[i] = top_k_ids[root_idx, :self.top_k]
+
             logger.debug(
                 "MARS req %d: draft=%s, branch_pos=%d/%d "
                 "(top1=%s, ratios=%s)",
@@ -2107,7 +2125,7 @@ class ParallelProposer:
                 top1_tokens[:3], [f"{r:.2f}" for r in ratios[:3]],
             )
 
-        return mars_positions
+        return mars_positions, mars_root_tokens
 
     def _apply_sampling_penalties(
         self,
@@ -2251,7 +2269,7 @@ class ParallelProposer:
         # (num_spec+1)*top_k to just top_k.
         mars_branch_positions: dict[int, list[int]] | None = None
         if self.mars_threshold > 0.0:
-            mars_branch_positions = self._compute_mars_branch_positions(
+            mars_branch_positions, _ = self._compute_mars_branch_positions(
                 target_token_ids, branch_hidden_states,
                 common_attn_metadata, batch_size,
                 is_early_exit=is_early_exit,
@@ -2500,42 +2518,29 @@ class ParallelProposer:
         if self._target_lm_head is None or self._request_ids is None:
             return
 
-        qsl = common_attn_metadata.query_start_loc
-        if qsl.device.type != "cpu":
-            qsl_cpu = qsl.cpu()
-        else:
-            qsl_cpu = qsl
+        # MARS dummy acceptance: compute branch positions for DECODE
+        # requests. Instead of branching at all positions, find the
+        # first rejection position and only branch there, reducing
+        # branch count from (num_spec+1)*top_k to just top_k.
+        # Also returns root tokens at the MARS position, avoiding a
+        # redundant compute_logits call.
+        mars_branch_positions: dict[int, list[int]] | None = None
+        mars_root_tokens: dict[int, torch.Tensor] = {}
+        if self.mars_threshold > 0.0:
+            mars_branch_positions, mars_root_tokens = (
+                self._compute_mars_branch_positions(
+                    target_token_ids, branch_hidden_states,
+                    common_attn_metadata, batch_size,
+                    is_early_exit=is_early_exit,
+                    sampling_metadata=sampling_metadata,
+                ))
 
-        # Analyze requests and determine branch positions
-        request_infos: list[dict | None] = []
-        for i in range(batch_size):
-            if i >= len(self._request_ids):
-                request_infos.append(None)
-                continue
-
-            qs = int(qsl_cpu[i].item())
-            qe = int(qsl_cpu[i + 1].item())
-            ql = qe - qs
-
-            # PREFILL vs DECODE detection (use query length, not valid token count)
-            is_prefill = self._is_prefill_request(i, ql)
-
-            # Get input_ids for cache key construction
-            req_input_ids = target_token_ids[qs:qe].tolist()
-
-            if is_prefill:
-                branch_positions = [ql - 1]
-            else:
-                max_pos = min(ql, self._num_speculative_tokens + 1)
-                branch_positions = list(range(max_pos))
-
-            request_infos.append({
-                "is_prefill": is_prefill,
-                "qs": qs,
-                "ql": ql,
-                "input_ids": req_input_ids,
-                "branch_positions": branch_positions,
-            })
+        # Analyze requests (with MARS overrides if available)
+        request_infos = self._analyze_requests_proposer(
+            target_token_ids, common_attn_metadata, batch_size,
+            mars_branch_positions=mars_branch_positions,
+        )
+        self._request_infos_proposer = request_infos
 
         # Clear caches for fresh round
         for i in range(batch_size):
@@ -2554,32 +2559,70 @@ class ParallelProposer:
         if max_branch_pos == 0:
             return
 
-        # Pre-compute root tokens per position
+        # Pre-compute root tokens per position. For DECODE requests
+        # that have MARS results, reuse the root tokens already
+        # computed during MARS (avoids a redundant compute_logits).
         root_tokens_per_pos: list[
             tuple[list[int], torch.Tensor] | None
         ] = []
         for pos_idx in range(max_branch_pos):
             hs_indices: list[int] = []
             active_reqs: list[int] = []
+            mars_reqs: list[int] = []  # reqs with cached MARS roots
+            mars_tokens_list: list[torch.Tensor] = []
             for i in range(batch_size):
                 info = request_infos[i]
                 if info is None or pos_idx >= len(info["branch_positions"]):
                     continue
-                pos = info["branch_positions"][pos_idx]
-                hs_indices.append(info["qs"] + pos)
-                active_reqs.append(i)
+                if i in mars_root_tokens:
+                    mars_reqs.append(i)
+                    mars_tokens_list.append(mars_root_tokens[i])
+                else:
+                    pos = info["branch_positions"][pos_idx]
+                    hs_indices.append(info["qs"] + pos)
+                    active_reqs.append(i)
 
-            if not active_reqs:
+            if not active_reqs and not mars_reqs:
                 root_tokens_per_pos.append(None)
                 continue
 
-            top_k_ids = self._compute_root_tokens(
-                branch_hidden_states, hs_indices, self.top_k,
-                is_early_exit=is_early_exit,
-                sampling_metadata=sampling_metadata,
-                active_reqs=active_reqs,
-            )
-            root_tokens_per_pos.append((active_reqs, top_k_ids))
+            # Compute root tokens only for non-MARS requests
+            if active_reqs:
+                top_k_ids = self._compute_root_tokens(
+                    branch_hidden_states, hs_indices, self.top_k,
+                    is_early_exit=is_early_exit,
+                    sampling_metadata=sampling_metadata,
+                    active_reqs=active_reqs,
+                )
+            else:
+                top_k_ids = None
+
+            # Merge MARS and non-MARS results
+            all_reqs: list[int] = []
+            all_tokens_list: list[torch.Tensor] = []
+            mars_idx = 0
+            non_mars_idx = 0
+            for i in range(batch_size):
+                info = request_infos[i]
+                if info is None or pos_idx >= len(info["branch_positions"]):
+                    continue
+                if i in mars_root_tokens:
+                    all_reqs.append(i)
+                    all_tokens_list.append(
+                        mars_tokens_list[mars_idx].unsqueeze(0))
+                    mars_idx += 1
+                elif top_k_ids is not None and non_mars_idx < len(
+                        active_reqs):
+                    all_reqs.append(i)
+                    all_tokens_list.append(
+                        top_k_ids[non_mars_idx].unsqueeze(0))
+                    non_mars_idx += 1
+
+            if all_tokens_list:
+                merged = torch.cat(all_tokens_list, dim=0)
+                root_tokens_per_pos.append((all_reqs, merged))
+            else:
+                root_tokens_per_pos.append(None)
 
         # Collect all branches into a flat list for batched generation.
         branches: list[dict] = []
@@ -2614,6 +2657,10 @@ class ParallelProposer:
         # For each request, add a branch whose root_token = correction_token
         # at the matching position, ensuring the cache key exactly matches
         # the lookup key. This guarantees 100% cache hit rate.
+        # Build set for O(1) duplicate check.
+        covered_keys: set[tuple[int, tuple[int, ...]]] = {
+            (b["req_idx"], b["cache_key"]) for b in branches
+        }
         if self._sampled_token_ids is not None:
             for i in range(batch_size):
                 info = request_infos[i]
@@ -2641,11 +2688,7 @@ class ParallelProposer:
                     key = tuple(filtered)
 
                 # Skip if already covered by a standard branch
-                already_covered = any(
-                    b["req_idx"] == i and b["cache_key"] == key
-                    for b in branches
-                )
-                if not already_covered:
+                if (i, key) not in covered_keys:
                     branches.append({
                         "req_idx": i,
                         "pos": matching_pos,

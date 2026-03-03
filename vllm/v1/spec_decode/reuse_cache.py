@@ -48,6 +48,8 @@ class ReuseCache:
         self.num_speculative_tokens = num_speculative_tokens
         self.enable_half_cache_hit = enable_half_cache_hit
         self._cache: dict[tuple[int, ...], ReuseCacheEntry] = {}
+        # Secondary index for O(1) prefix lookup (half-cache-hit)
+        self._prefix_index: dict[tuple[int, ...], ReuseCacheEntry] = {}
 
         # Statistics
         self._hit_count: int = 0
@@ -83,6 +85,8 @@ class ReuseCache:
             base_position=base_position,
         )
         self._cache[lookup_key] = entry
+        if self.enable_half_cache_hit and len(lookup_key) > 1:
+            self._prefix_index[lookup_key[:-1]] = entry
 
         elapsed = time.monotonic_ns() - start
         self._total_store_time_ns += elapsed
@@ -123,23 +127,22 @@ class ReuseCache:
             )
             return list(entry.continuation_tokens)
 
-        # Half-cache-hit: prefix match (only when enabled)
+        # Half-cache-hit: O(1) prefix match via secondary index
         if self.enable_half_cache_hit and len(key_tuple) > 1:
             prefix = key_tuple[:-1]
-            for cached_key, cached_entry in self._cache.items():
-                if len(cached_key) == len(key_tuple) and \
-                        cached_key[:-1] == prefix:
-                    self._half_hit_count += 1
-                    elapsed = time.monotonic_ns() - start
-                    self._total_lookup_time_ns += elapsed
-                    self._lookup_count += 1
-                    logger.debug(
-                        "ReuseCache HALF-HIT: key=%s, "
-                        "matched_key=%s -> tokens=%s",
-                        key_tuple, cached_key,
-                        cached_entry.continuation_tokens,
-                    )
-                    return list(cached_entry.continuation_tokens)
+            cached_entry = self._prefix_index.get(prefix)
+            if cached_entry is not None:
+                self._half_hit_count += 1
+                elapsed = time.monotonic_ns() - start
+                self._total_lookup_time_ns += elapsed
+                self._lookup_count += 1
+                logger.debug(
+                    "ReuseCache HALF-HIT: key=%s, "
+                    "prefix=%s -> tokens=%s",
+                    key_tuple, prefix,
+                    cached_entry.continuation_tokens,
+                )
+                return list(cached_entry.continuation_tokens)
 
         # Miss
         self._miss_count += 1
@@ -152,6 +155,7 @@ class ReuseCache:
     def clear(self) -> None:
         """Remove all entries from the cache."""
         self._cache.clear()
+        self._prefix_index.clear()
         logger.debug("ReuseCache cleared")
 
     @property
