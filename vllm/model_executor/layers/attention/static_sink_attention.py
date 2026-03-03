@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+from copy import copy
 
 import torch
 
@@ -74,6 +75,25 @@ def create_static_sink_attention_backend(
                 device=device,
                 dtype=torch.int32,
             )
+            # Separate buffer for build_for_drafting to avoid corrupting
+            # main model's FlashAttentionMetadata during Parallel-SD
+            # async CUDA stream execution.
+            self.block_table_with_sink_draft = torch.zeros(
+                (
+                    scheduler_config.max_num_seqs,
+                    self.max_num_blocks + self.num_sink_blocks,
+                ),
+                device=device,
+                dtype=torch.int32,
+            )
+            self.block_table_with_sink_draft[
+                :, : self.num_sink_blocks
+            ] = torch.arange(
+                1,
+                self.num_sink_blocks + 1,
+                device=device,
+                dtype=torch.int32,
+            )
 
         def build(
             self,
@@ -81,20 +101,12 @@ def create_static_sink_attention_backend(
             common_attn_metadata: CommonAttentionMetadata,
             fast_build: bool = False,
         ) -> AttentionMetadata:
-            # Save original REFERENCES (not data) so we can restore after
-            # build(). We create NEW tensors for the sink-adjusted values
-            # so that the built AttentionMetadata holds its own tensors,
-            # independent of the originals.
-            original_seq_lens = common_attn_metadata.seq_lens
-            original_max_seq_len = common_attn_metadata.max_seq_len
-            original_block_table = common_attn_metadata.block_table_tensor
-
-            # Create a NEW tensor with sink-adjusted seq_lens
-            # (not in-place modify, to avoid aliasing with metadata)
-            sink_seq_lens = common_attn_metadata.seq_lens + self.sink_len
-            sink_seq_lens[sink_seq_lens == self.sink_len] = 0
-            common_attn_metadata.seq_lens = sink_seq_lens
-
+            common_attn_metadata.seq_lens[:] = (
+                common_attn_metadata.seq_lens + self.sink_len
+            )
+            common_attn_metadata.seq_lens[
+                common_attn_metadata.seq_lens == self.sink_len
+            ] = 0
             common_attn_metadata.max_seq_len = (
                 common_attn_metadata.max_seq_len + self.sink_len
             )
@@ -102,21 +114,55 @@ def create_static_sink_attention_backend(
             num_reqs = common_attn_metadata.num_reqs
             self.block_table_with_sink[
                 :num_reqs, self.num_sink_blocks : self.num_sink_blocks + max_num_blocks
-            ] = original_block_table[:, :max_num_blocks]
+            ] = common_attn_metadata.block_table_tensor[:, :max_num_blocks]
             common_attn_metadata.block_table_tensor = self.block_table_with_sink[
                 :num_reqs
             ]
 
-            result = super().build(common_prefix_len, common_attn_metadata, fast_build)
+            return super().build(common_prefix_len, common_attn_metadata, fast_build)
 
-            # Restore original references (the built metadata keeps the
-            # sink-adjusted tensors; common_attn_metadata gets originals
-            # back so repeated calls don't accumulate sink_len).
-            common_attn_metadata.seq_lens = original_seq_lens
-            common_attn_metadata.max_seq_len = original_max_seq_len
-            common_attn_metadata.block_table_tensor = original_block_table
+        def build_for_drafting(
+            self,
+            common_attn_metadata: CommonAttentionMetadata,
+            draft_index: int,
+        ) -> AttentionMetadata:
+            # Parallel-SD safe: uses copies instead of in-place modification.
+            #
+            # After main model's build(), the shared seq_lens tensor is L+S
+            # (from in-place [:] modification). Adding another S gives L+2S,
+            # matching the double-adjustment behavior the drafter needs.
+            #
+            # We use a separate block_table buffer and new seq_lens tensor
+            # to avoid race conditions when Parallel-SD runs the drafter
+            # concurrently on a separate CUDA stream.
+            draft_cm = copy(common_attn_metadata)
 
-            return result
+            sink_seq_lens = common_attn_metadata.seq_lens + self.sink_len
+            sink_seq_lens[sink_seq_lens == self.sink_len] = 0
+            draft_cm.seq_lens = sink_seq_lens
+
+            draft_cm.max_seq_len = (
+                common_attn_metadata.max_seq_len + self.sink_len
+            )
+
+            max_num_blocks = cdiv(draft_cm.max_seq_len, self.block_size)
+            num_reqs = draft_cm.num_reqs
+
+            self.block_table_with_sink_draft[
+                :num_reqs,
+                self.num_sink_blocks : self.num_sink_blocks + max_num_blocks,
+            ] = common_attn_metadata.block_table_tensor[:, :max_num_blocks]
+            draft_cm.block_table_tensor = self.block_table_with_sink_draft[
+                :num_reqs
+            ]
+
+            # Call underlying builder's build() directly (skip our build()
+            # which does in-place modification).
+            return super().build(
+                common_prefix_len=0,
+                common_attn_metadata=draft_cm,
+                fast_build=True,
+            )
 
     attn_backend = subclass_attention_backend(
         name_prefix=prefix,
