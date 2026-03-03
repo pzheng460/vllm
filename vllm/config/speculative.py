@@ -173,6 +173,11 @@ class SpeculativeConfig:
     generation (e.g. 'cuda:1'). When set, a remote Eagle model is
     loaded on this device and branch generation runs truly in parallel
     with the target model forward on GPU 0."""
+    parallel_mars_threshold: float = 0.9
+    """MARS logit ratio threshold θ for dummy acceptance. When the ratio
+    z_2/z_1 between top-2 and top-1 logit values exceeds this threshold,
+    a tie-case draft token is considered accepted. Set to 0.0 to disable
+    MARS and branch at all positions (original behavior)."""
 
     def compute_hash(self) -> str:
         """
@@ -683,13 +688,15 @@ class SpeculativeConfig:
         logger.info(
             "Parallel speculative decoding configured: "
             "draft_method=%s, top_k=%d, half_cache_hit=%s, "
-            "early_exit_layer=%d, concurrent=%s, draft_device=%s",
+            "early_exit_layer=%d, concurrent=%s, draft_device=%s, "
+            "mars_threshold=%.2f",
             self.parallel_draft_method,
             self.parallel_top_k,
             self.parallel_enable_half_cache_hit,
             self.parallel_early_exit_layer,
             self.parallel_enable_concurrent,
             self.parallel_draft_device,
+            self.parallel_mars_threshold,
         )
 
     def _validate_suffix_decoding(self):

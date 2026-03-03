@@ -66,6 +66,7 @@ class ParallelProposer:
         self._draft_method = spec_config.parallel_draft_method or "eagle"
         self.top_k = spec_config.parallel_top_k
         self.enable_half_cache_hit = spec_config.parallel_enable_half_cache_hit
+        self.mars_threshold = spec_config.parallel_mars_threshold
         self.early_exit_layer = spec_config.parallel_early_exit_layer
         self.enable_concurrent = getattr(
             spec_config, "parallel_enable_concurrent", False,
@@ -1872,7 +1873,8 @@ class ParallelProposer:
         is_early_exit: bool = False,
         sampling_metadata: "SamplingMetadata | None" = None,
         active_reqs: list[int] | None = None,
-    ) -> torch.Tensor:
+        return_logit_values: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute root tokens from hidden states.
 
         Uses different compute_logits paths depending on the source:
@@ -1891,9 +1893,17 @@ class ParallelProposer:
                 presence) are applied to logits to match rejection sampler.
             active_reqs: Request indices corresponding to each position,
                 needed for per-request penalty lookup.
+            return_logit_values: If True, also return top-2 logit values
+                for MARS dummy acceptance computation.
 
         Returns:
-            Tensor of shape [num_positions, top_k] with token IDs.
+            If return_logit_values is False:
+                Tensor of shape [num_positions, top_k] with token IDs.
+            If return_logit_values is True:
+                Tuple of (top_k_ids [num_positions, top_k],
+                          top_2_values [num_positions, 2]) where
+                top_2_values[:, 0] is top-1 logit value and
+                top_2_values[:, 1] is top-2 logit value.
         """
         pos_tensor = torch.tensor(
             positions, dtype=torch.long, device=hidden_states.device,
@@ -1917,10 +1927,16 @@ class ParallelProposer:
                 "is_early_exit=%s, positions=%s, hs_shape=%s",
                 is_early_exit, positions, hidden_states.shape,
             )
-            return torch.zeros(
+            zeros = torch.zeros(
                 len(positions), top_k,
                 dtype=torch.long, device=hidden_states.device,
             )
+            if return_logit_values:
+                zero_vals = torch.zeros(
+                    len(positions), 2, device=hidden_states.device,
+                )
+                return zeros, zero_vals
+            return zeros
 
         # Apply sampling penalties (repetition, frequency, presence) to
         # match the rejection sampler. Without this, root tokens computed
@@ -1932,8 +1948,166 @@ class ParallelProposer:
             logits = self._apply_sampling_penalties(
                 logits, sampling_metadata, active_reqs)
 
+        if return_logit_values:
+            # Return both top-k IDs and top-2 logit values for MARS
+            k_for_topk = max(top_k, 2)
+            top_vals, top_ids = torch.topk(logits, k=k_for_topk, dim=-1)
+            top_k_ids = top_ids[:, :top_k]
+            top_2_values = top_vals[:, :2]  # [num_positions, 2]
+            return top_k_ids, top_2_values
+
         _, top_k_ids = torch.topk(logits, k=top_k, dim=-1)
         return top_k_ids
+
+    @staticmethod
+    def _mars_dummy_acceptance(
+        draft_tokens: list[int],
+        top1_tokens: list[int],
+        top2_tokens: list[int],
+        logit_ratios: list[float],
+        threshold: float,
+    ) -> int:
+        """Find the first rejected position using MARS dummy acceptance.
+
+        Iterates through draft tokens and checks against the target model's
+        top-1 and top-2 predictions at each verification position:
+          1. draft == top1 → ACCEPT (exact match)
+          2. draft == top2 AND ratio > θ → ACCEPT (tie case)
+          3. Otherwise → REJECT
+
+        This is a *dummy* acceptance — it predicts where the real verifier
+        will reject, so we only need to branch at that position.
+
+        Args:
+            draft_tokens: Draft token IDs being verified (d1, d2, ..., dN).
+            top1_tokens: Top-1 token ID at each verification position.
+            top2_tokens: Top-2 token ID at each verification position.
+            logit_ratios: z_2 / z_1 ratio at each verification position.
+            threshold: MARS acceptance threshold θ (default 0.9).
+
+        Returns:
+            Index of the first rejected position (0-indexed).
+            If all are accepted, returns len(draft_tokens).
+        """
+        for i, draft_token in enumerate(draft_tokens):
+            if draft_token == top1_tokens[i]:
+                continue  # ACCEPT: exact match with top-1
+            if (draft_token == top2_tokens[i]
+                    and logit_ratios[i] > threshold):
+                continue  # ACCEPT: tie case (top-2 with high ratio)
+            return i  # REJECT: first rejection position
+        return len(draft_tokens)  # All accepted
+
+    def _compute_mars_branch_positions(
+        self,
+        target_token_ids: torch.Tensor,
+        branch_hidden_states: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        batch_size: int,
+        is_early_exit: bool = False,
+        sampling_metadata: "SamplingMetadata | None" = None,
+    ) -> dict[int, list[int]]:
+        """Compute MARS-optimized branch positions for DECODE requests.
+
+        For each DECODE request, runs MARS dummy acceptance to find the
+        first rejected position. Only that position is returned as the
+        branch position, reducing the total number of branches.
+
+        PREFILL requests are skipped (they always branch at the last
+        position, which is already the default).
+
+        Args:
+            target_token_ids: Flat token IDs for the batch.
+            branch_hidden_states: Hidden states for computing logits.
+            common_attn_metadata: Attention metadata with query_start_loc.
+            batch_size: Number of requests in the batch.
+            is_early_exit: Whether hidden states are from early exit.
+            sampling_metadata: Sampling metadata for penalty application.
+
+        Returns:
+            Dict mapping request index → [branch_position] for DECODE
+            requests. PREFILL requests are not included.
+        """
+        mars_positions: dict[int, list[int]] = {}
+
+        qsl = common_attn_metadata.query_start_loc
+        if qsl.device.type != "cpu":
+            qsl_cpu = qsl.cpu()
+        else:
+            qsl_cpu = qsl
+
+        for i in range(batch_size):
+            if self._request_ids and i >= len(self._request_ids):
+                continue
+
+            qs = int(qsl_cpu[i].item())
+            qe = int(qsl_cpu[i + 1].item())
+            ql = qe - qs
+
+            if ql <= 1:
+                continue
+
+            # Skip PREFILL requests — they always branch at the last pos
+            is_prefill = self._is_prefill_request(i, ql)
+            if is_prefill:
+                continue
+
+            # For DECODE: input_ids = [last_accepted, d1, d2, ..., dN]
+            # Draft tokens being verified are d1..dN = input_ids[1:]
+            # Position p's logits predict the token at position p+1
+            req_input_ids = target_token_ids[qs:qe].tolist()
+            draft_tokens = req_input_ids[1:]  # d1, d2, ..., dN
+
+            if not draft_tokens:
+                continue
+
+            # Number of verification positions = len(draft_tokens)
+            # Position p in [0, len(draft_tokens)-1]: logits at p predict
+            # the token at position p+1 (i.e., draft_tokens[p])
+            num_verify_positions = len(draft_tokens)
+            hs_indices = [qs + p for p in range(num_verify_positions)]
+
+            # Compute top-2 logits at each verification position
+            top_2_ids, top_2_values = self._compute_root_tokens(
+                branch_hidden_states, hs_indices, top_k=2,
+                is_early_exit=is_early_exit,
+                sampling_metadata=sampling_metadata,
+                active_reqs=[i] * num_verify_positions,
+                return_logit_values=True,
+            )
+
+            # Extract top-1/top-2 tokens and compute logit ratios
+            top1_tokens = top_2_ids[:, 0].tolist()
+            top2_tokens = top_2_ids[:, 1].tolist()
+
+            # Compute ratio r_i = z_2 / z_1 (avoid division by zero)
+            z1 = top_2_values[:, 0]  # top-1 logit values
+            z2 = top_2_values[:, 1]  # top-2 logit values
+            # When z1 is zero or negative, ratio is 0 (reject tie case)
+            ratios = torch.where(
+                z1 > 0, z2 / z1, torch.zeros_like(z1),
+            ).tolist()
+
+            # Run MARS dummy acceptance
+            branch_pos = self._mars_dummy_acceptance(
+                draft_tokens, top1_tokens, top2_tokens,
+                ratios, self.mars_threshold,
+            )
+
+            # Clamp to valid range: branch_pos can be at most ql-1
+            # (the last position in the verification window)
+            branch_pos = min(branch_pos, ql - 1)
+
+            mars_positions[i] = [branch_pos]
+
+            logger.debug(
+                "MARS req %d: draft=%s, branch_pos=%d/%d "
+                "(top1=%s, ratios=%s)",
+                i, draft_tokens, branch_pos, ql,
+                top1_tokens[:3], [f"{r:.2f}" for r in ratios[:3]],
+            )
+
+        return mars_positions
 
     def _apply_sampling_penalties(
         self,
@@ -1990,8 +2164,17 @@ class ParallelProposer:
         target_token_ids: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
         batch_size: int,
+        mars_branch_positions: dict[int, list[int]] | None = None,
     ) -> list[dict | None]:
         """Analyze requests to determine PREFILL/DECODE mode and positions.
+
+        Args:
+            target_token_ids: Flat token IDs for the batch.
+            common_attn_metadata: Attention metadata with query_start_loc.
+            batch_size: Number of requests in the batch.
+            mars_branch_positions: Optional dict mapping request index to
+                MARS-computed branch positions. When provided, overrides
+                the default "branch at all positions" for DECODE requests.
 
         Returns per-request info dicts (or None for skipped requests).
         """
@@ -2020,6 +2203,8 @@ class ParallelProposer:
 
             if is_prefill:
                 branch_positions = [ql - 1]
+            elif mars_branch_positions is not None and i in mars_branch_positions:
+                branch_positions = mars_branch_positions[i]
             else:
                 max_pos = min(ql, self._num_speculative_tokens + 1)
                 branch_positions = list(range(max_pos))
@@ -2060,9 +2245,23 @@ class ParallelProposer:
         if self._target_lm_head is None or self._request_ids is None:
             return
 
-        # Analyze requests
+        # MARS dummy acceptance: compute branch positions for DECODE requests.
+        # Instead of branching at all positions, find the first rejection
+        # position and only branch there, reducing branch count from
+        # (num_spec+1)*top_k to just top_k.
+        mars_branch_positions: dict[int, list[int]] | None = None
+        if self.mars_threshold > 0.0:
+            mars_branch_positions = self._compute_mars_branch_positions(
+                target_token_ids, branch_hidden_states,
+                common_attn_metadata, batch_size,
+                is_early_exit=is_early_exit,
+                sampling_metadata=sampling_metadata,
+            )
+
+        # Analyze requests (with MARS overrides if available)
         request_infos = self._analyze_requests_proposer(
             target_token_ids, common_attn_metadata, batch_size,
+            mars_branch_positions=mars_branch_positions,
         )
         self._request_infos_proposer = request_infos
 
