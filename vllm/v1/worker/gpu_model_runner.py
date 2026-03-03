@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json as _json_mod
+import os as _os_mod
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -12,6 +14,11 @@ from copy import copy, deepcopy
 from functools import reduce
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+
+# Lightweight verify-time benchmarking (controlled by env var)
+_BENCH_VERIFY_TIME = bool(_os_mod.environ.get("VLLM_BENCH_VERIFY_TIME"))
+_BENCH_VERIFY_FILE = _os_mod.environ.get("VLLM_BENCH_VERIFY_FILE",
+                                          "/tmp/vllm_verify_times.jsonl")
 
 import numpy as np
 import torch
@@ -3300,6 +3307,15 @@ class GPUModelRunner(
             )
 
         # Run the model.
+        # -- Bench: start timing verify forward pass --
+        _bench_vf_start = None
+        if (_BENCH_VERIFY_TIME and self.device.index == 0
+                and self.speculative_config is not None
+                and num_scheduled_tokens > 1):
+            torch.cuda.synchronize(self.device)
+            _bench_vf_start = time.perf_counter()
+            _bench_n_tokens = num_scheduled_tokens
+
         # Use persistent buffers for CUDA graphs.
         with (
             set_forward_context(
@@ -3321,6 +3337,16 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # -- Bench: end timing verify forward pass --
+        if _bench_vf_start is not None:
+            torch.cuda.synchronize(self.device)
+            _bench_vf_ms = (time.perf_counter() - _bench_vf_start) * 1000
+            with open(_BENCH_VERIFY_FILE, 'a') as _bf:
+                _bf.write(_json_mod.dumps({
+                    "num_tokens": _bench_n_tokens,
+                    "elapsed_ms": round(_bench_vf_ms, 4),
+                }) + '\n')
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

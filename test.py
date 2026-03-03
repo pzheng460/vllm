@@ -8,12 +8,9 @@ def start_vllm():
 
     served_model_name = "pangu"
     spec_cfg = {
-        "method": "parallel",
+        "method": "mtp",
         "model": spec_model_path,
-        "num_speculative_tokens": 1,
-        "draft_tensor_parallel_size": 1,
-        "parallel_draft_method": "mtp",
-        "parallel_top_k": 1,
+        "num_speculative_tokens": 1
     }
 
     command = [
@@ -21,7 +18,7 @@ def start_vllm():
         "--host", "0.0.0.0",
         "--port", "8300",
         "--dtype", "bfloat16",
-        "--tensor-parallel-size", "2",
+        "--tensor-parallel-size", "4",
         "--max-num-seqs", "1",
         "--tokenizer", main_model_path,
         "--gpu-memory-utilization", "0.95",
@@ -32,7 +29,7 @@ def start_vllm():
     ]
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "2,3"
+    env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
     env["VLLM_TORCH_COMPILE"] = "0"
     env["TORCH_COMPILE_DISABLE"] = "1"
     env["TORCHDYNAMO_DISABLE"] = "1"

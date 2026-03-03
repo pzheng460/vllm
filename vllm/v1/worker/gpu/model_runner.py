@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json as _json_mod
+import os as _os_mod
 import time
 from copy import deepcopy
 from typing import Any
+
+# Lightweight verify-time benchmarking (controlled by env var)
+_BENCH_VERIFY_TIME = bool(_os_mod.environ.get("VLLM_BENCH_VERIFY_TIME"))
+_BENCH_VERIFY_FILE = _os_mod.environ.get("VLLM_BENCH_VERIFY_FILE",
+                                          "/tmp/vllm_verify_times.jsonl")
 
 import numpy as np
 import torch
@@ -955,6 +962,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
         # Run model.
+        # -- Bench: start timing verify forward pass --
+        _bench_vf_start = None
+        if (_BENCH_VERIFY_TIME and not dummy_run
+                and self.device.index == 0 and self.do_spec_decode):
+            _bench_n_tokens = scheduler_output.total_num_scheduled_tokens
+            if _bench_n_tokens > 1:
+                torch.cuda.synchronize(self.device)
+                _bench_vf_start = time.perf_counter()
+
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Run CUDA graph.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -980,6 +996,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     input_ids=input_batch.input_ids,
                     positions=positions,
                 )
+
+        # -- Bench: end timing verify forward pass --
+        if _bench_vf_start is not None:
+            torch.cuda.synchronize(self.device)
+            _bench_vf_ms = (time.perf_counter() - _bench_vf_start) * 1000
+            with open(_BENCH_VERIFY_FILE, 'a') as _bf:
+                _bf.write(_json_mod.dumps({
+                    "num_tokens": _bench_n_tokens,
+                    "elapsed_ms": round(_bench_vf_ms, 4),
+                }) + '\n')
 
         # Strategy A: launch async standard branch gen after target forward.
         # No-op if already launched by early exit hook (Strategy B).
