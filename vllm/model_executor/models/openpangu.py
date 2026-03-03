@@ -84,6 +84,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.flash_attn_diffkv import FlashAttentionDiffKVBackend
 
 
@@ -648,7 +649,16 @@ class OpenPanguSinkAttention(nn.Module):
         else:
             sliding_window = None
 
-        FlashAttentionDiffKVBackend.set_head_size_v(self.v_channels)
+        # Detect if V padding is needed for FA2 compatibility.
+        # FA2 requires K and V to have the same head dimension,
+        # while FA3 (SM90+) supports different K/V head sizes natively.
+        fa_version = get_flash_attn_version()
+        self._pad_v = (self.v_channels != self.head_dim) and (
+            fa_version is None or fa_version < 3
+        )
+        self._effective_v_size = self.head_dim if self._pad_v else self.v_channels
+
+        FlashAttentionDiffKVBackend.set_head_size_v(self._effective_v_size)
         self.attn = StaticSinkAttention(
             self.num_heads,
             self.head_dim,
@@ -661,7 +671,7 @@ class OpenPanguSinkAttention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
             attn_backend=FlashAttentionDiffKVBackend,
-            head_size_v=self.v_channels,
+            head_size_v=self._effective_v_size,
         )
 
         if self.param_sink_number > 0:
@@ -766,14 +776,28 @@ class OpenPanguSinkAttention(nn.Module):
         q = q.view(-1, self.q_size)
         k = k.view(-1, self.k_size)
 
+        # Pad V from v_channels -> head_dim for FA2 compatibility
+        if self._pad_v:
+            v = v.view(-1, self.num_kv_heads, self.v_channels)
+            v = torch.nn.functional.pad(
+                v, (0, self.head_dim - self.v_channels))
+            v = v.view(-1, self.num_kv_heads * self.head_dim)
+
         attn_output = self.attn(
             q,
             k,
             v,
             output_shape=torch.Size(
-                [q.shape[0], q.shape[1] // self.head_dim * self.v_channels]
+                [q.shape[0], self.num_heads * self._effective_v_size]
             ),
         )
+
+        # Slice output back from head_dim -> v_channels after attention
+        if self._pad_v:
+            attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
+            attn_output = attn_output[:, :, :self.v_channels].contiguous()
+            attn_output = attn_output.view(-1, self.num_heads * self.v_channels)
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -799,7 +823,12 @@ class OpenPanguSinkAttention(nn.Module):
         else:
             param_sink_key = self.param_sink_key
 
-        self.attn.update_sink_kv(param_sink_key, self.param_sink_value)
+        param_sink_value = self.param_sink_value
+        if self._pad_v:
+            param_sink_value = torch.nn.functional.pad(
+                param_sink_value, (0, self.head_dim - self.v_channels))
+
+        self.attn.update_sink_kv(param_sink_key, param_sink_value)
 
 
 class OpenPanguDecoderLayer(nn.Module):
