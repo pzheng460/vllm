@@ -7,7 +7,9 @@ draft token branches and caches them for reuse when the target model's
 actual outputs match a predicted branch.
 """
 
+import json as _json
 import logging
+import os
 import time
 from typing import Any
 
@@ -473,6 +475,30 @@ class ParallelSpeculator:
             self._global_miss += stats["miss"]
             self._global_half_hit += stats["half_hit"]
             del self._reuse_caches[request_id]
+
+            # Always dump cumulative stats to fixed path
+            total = (self._global_hit + self._global_miss
+                     + self._global_half_hit)
+            hit_rate = self._global_hit / total if total > 0 else 0.0
+            logger.info(
+                "ParallelSpeculator cache stats: hit=%d miss=%d "
+                "half_hit=%d total=%d hit_rate=%.3f",
+                self._global_hit, self._global_miss,
+                self._global_half_hit, total, hit_rate,
+            )
+            stats_file = os.environ.get("VLLM_CACHE_STATS_FILE")
+            if stats_file:
+                try:
+                    with open(stats_file, "w") as f:
+                        _json.dump({
+                            "hit": self._global_hit,
+                            "miss": self._global_miss,
+                            "half_hit": self._global_half_hit,
+                            "total": total,
+                            "hit_rate": hit_rate,
+                        }, f)
+                except Exception as e:
+                    logger.warning("Failed to write cache stats: %s", e)
 
     # ------------------------------------------------------------------
     # Core: Root token computation

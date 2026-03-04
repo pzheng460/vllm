@@ -11,7 +11,9 @@ and wraps the runtime EagleProposer, unlike ParallelSpeculator which
 wraps EagleSpeculator at the Speculator level (vllm/v1/worker/gpu/spec_decode/).
 """
 
+import json as _json
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -1716,22 +1718,6 @@ class ParallelProposer:
 
         if async_ok:
             self._stored_batch_state = None
-            # Skip targeted gen in cross-device mode: fallback Eagle
-            # propose (0.66ms) is much faster than serial targeted gen
-            # (2.76ms). With cross-device, async gen covers ~25% of
-            # cache keys; for the rest, the batched fallback handles
-            # them efficiently.
-            if self._draft_device is None:
-                try:
-                    self._generate_targeted_branches(
-                        target_token_ids, target_positions,
-                        target_hidden_states, next_token_ids,
-                        effective_lti, common_attn_metadata,
-                        sampling_metadata, mm_embed_inputs,
-                        num_rejected_tokens_gpu, batch_size,
-                    )
-                except RuntimeError as e:
-                    logger.debug("Targeted branch gen skipped: %s", e)
         else:
             # No async branches — run full synchronous branch gen
             self._stored_batch_state = None
@@ -1754,12 +1740,33 @@ class ParallelProposer:
             except RuntimeError as e:
                 logger.debug("Branch generation skipped: %s", e)
 
-        # Phase 1: Cache Lookup (in current round's cache)
+        # Phase 1: Cache Lookup (only standard branches)
         cache_hits = self._cache_lookup(batch_size)
 
-        # Phase 2 & 3: Skip fallback when all requests have cache hits
+        # Phase 2: For cache misses, generate targeted branches as fallback.
+        # Targeted branches use the actual correction_token as root, so their
+        # draft tokens are correct. This is cheaper than a full propose call.
+        cache_misses = set(range(batch_size)) - set(cache_hits.keys())
+        if cache_misses:
+            try:
+                self._generate_targeted_branches(
+                    target_token_ids, target_positions,
+                    target_hidden_states, next_token_ids,
+                    effective_lti, common_attn_metadata,
+                    sampling_metadata, mm_embed_inputs,
+                    num_rejected_tokens_gpu, batch_size,
+                )
+                # Re-lookup to pick up targeted branch results
+                targeted_hits = self._cache_lookup_for_requests(
+                    cache_misses, batch_size,
+                )
+                cache_hits.update(targeted_hits)
+            except RuntimeError as e:
+                logger.debug("Targeted branch gen skipped: %s", e)
+
+        # Phase 3: Construct result — cache hits + fallback for remaining
         if len(cache_hits) == batch_size and batch_size > 0:
-            # All cache hits — construct result directly, skip fallback
+            # All resolved (standard hits + targeted hits)
             result = torch.zeros(
                 batch_size, self._num_speculative_tokens,
                 dtype=torch.int64, device=next_token_ids.device,
@@ -1769,7 +1776,7 @@ class ParallelProposer:
                 for t in range(n):
                     result[req_idx, t] = cached_tokens[t]
         else:
-            # Some misses — run fallback and merge cache hits
+            # Still some misses — run full fallback propose
             result = self._underlying.propose(
                 target_token_ids, target_positions, target_hidden_states,
                 next_token_ids, last_token_indices, common_attn_metadata,
@@ -1815,6 +1822,30 @@ class ParallelProposer:
             self._global_half_hit += stats["half_hit"]
             del self._reuse_caches[req_id]
 
+            # Log and dump cumulative cache stats
+            total = (self._global_hit + self._global_miss
+                     + self._global_half_hit)
+            hit_rate = self._global_hit / total if total > 0 else 0.0
+            logger.info(
+                "ParallelProposer cache stats: hit=%d miss=%d "
+                "half_hit=%d total=%d hit_rate=%.3f",
+                self._global_hit, self._global_miss,
+                self._global_half_hit, total, hit_rate,
+            )
+            stats_file = os.environ.get("VLLM_CACHE_STATS_FILE")
+            if stats_file:
+                try:
+                    with open(stats_file, "w") as f:
+                        _json.dump({
+                            "hit": self._global_hit,
+                            "miss": self._global_miss,
+                            "half_hit": self._global_half_hit,
+                            "total": total,
+                            "hit_rate": hit_rate,
+                        }, f)
+                except Exception as e:
+                    logger.warning("Failed to write cache stats: %s", e)
+
     # ------------------------------------------------------------------
     # Phase 1: Cache Lookup
     # ------------------------------------------------------------------
@@ -1848,6 +1879,48 @@ class ParallelProposer:
             hit = cache.lookup(filtered)
             if hit is not None and len(hit) > 0:
                 cache_hits[i] = hit
+
+        return cache_hits
+
+    def _cache_lookup_for_requests(
+        self,
+        request_indices: set[int],
+        batch_size: int,
+    ) -> dict[int, list[int]]:
+        """Look up cache for specific request indices only.
+
+        Used after targeted branch generation to check if the targeted
+        branches resolved any cache misses. Does NOT update cache
+        hit/miss statistics (those were already counted in Phase 1).
+        """
+        cache_hits: dict[int, list[int]] = {}
+        if self._sampled_token_ids is None or self._request_ids is None:
+            return cache_hits
+
+        for i in request_indices:
+            if i >= len(self._request_ids) or i >= batch_size:
+                continue
+            req_id = self._request_ids[i]
+            cache = self._reuse_caches.get(req_id)
+            if cache is None:
+                continue
+
+            if isinstance(self._sampled_token_ids, torch.Tensor):
+                if self._sampled_token_ids.dim() == 1:
+                    tokens = [self._sampled_token_ids[i].item()]
+                else:
+                    tokens = self._sampled_token_ids[i].tolist()
+            else:
+                tokens = list(self._sampled_token_ids[i])
+
+            filtered = [t for t in tokens if t != -1]
+            if not filtered:
+                continue
+
+            # Direct cache access without updating statistics
+            entry = cache._cache.get(tuple(filtered))
+            if entry is not None:
+                cache_hits[i] = entry.continuation_tokens
 
         return cache_hits
 
@@ -2411,50 +2484,9 @@ class ParallelProposer:
                         "ql": info["ql"],
                     })
 
-        # Inject targeted branches (guaranteed cache hit).
-        # For each request, add a branch whose root_token = correction_token
-        # at the matching position, ensuring the cache key exactly matches
-        # the lookup key. This guarantees 100% cache hit rate.
-        if self._sampled_token_ids is not None:
-            for i in range(batch_size):
-                info = request_infos[i]
-                if info is None or i >= len(self._request_ids):
-                    continue
-
-                correction_token = next_token_ids[i].item()
-
-                if info["is_prefill"]:
-                    matching_pos = info["ql"] - 1
-                    key = (correction_token,)
-                else:
-                    # Get filtered sampled_token_ids for lookup key
-                    if isinstance(self._sampled_token_ids, torch.Tensor):
-                        if self._sampled_token_ids.dim() == 1:
-                            tokens = [self._sampled_token_ids[i].item()]
-                        else:
-                            tokens = self._sampled_token_ids[i].tolist()
-                    else:
-                        tokens = list(self._sampled_token_ids[i])
-                    filtered = [t for t in tokens if t != -1]
-                    if not filtered:
-                        continue
-                    matching_pos = len(filtered) - 1
-                    key = tuple(filtered)
-
-                # Skip if already covered by a standard branch
-                already_covered = any(
-                    b["req_idx"] == i and b["cache_key"] == key
-                    for b in branches
-                )
-                if not already_covered:
-                    branches.append({
-                        "req_idx": i,
-                        "pos": matching_pos,
-                        "root_token": correction_token,
-                        "cache_key": key,
-                        "qs": info["qs"],
-                        "ql": info["ql"],
-                    })
+        # NOTE: Targeted branches are NOT injected here. They are generated
+        # after cache lookup (Phase 1) only for cache misses, as a fallback
+        # to avoid the expensive full propose call. See propose() Phase 2.
 
         if not branches:
             return
