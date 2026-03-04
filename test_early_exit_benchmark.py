@@ -52,6 +52,10 @@ os.environ["VLLM_SPEC_STATS_FILE"] = _SPEC_STATS_FILE
 # Log stats frequently so acceptance metrics are flushed
 os.environ["VLLM_LOG_STATS_INTERVAL"] = "1"
 
+# Run EngineCore in-process so SpecDecodingStats flows to LoggingStatLogger
+# without IPC serialization issues
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
 
 # ---------------------------------------------------------------------------
 # Dataset loaders

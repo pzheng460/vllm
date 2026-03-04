@@ -2411,6 +2411,9 @@ class ParallelProposer:
                 "branch_positions": branch_positions,
             })
 
+        # Store request_infos for _generate_targeted_branches()
+        self._request_infos_proposer = request_infos
+
         # Clear caches for fresh round
         for i in range(batch_size):
             if i < len(self._request_ids):
