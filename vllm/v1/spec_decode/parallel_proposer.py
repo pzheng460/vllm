@@ -75,6 +75,12 @@ class ParallelProposer:
         self.disable_targeted_branch = bool(
             os.environ.get("VLLM_DISABLE_TARGETED_BRANCH", "")
         )
+        # When targeted branch is disabled, force half-cache-hit on so
+        # cache misses still use early-exit branch tokens (wrong root but
+        # same prefix), rather than falling back to standard MTP propose
+        # which would contaminate acceptance length statistics.
+        if self.disable_targeted_branch:
+            self.enable_half_cache_hit = True
         self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
         # Per-request reuse caches: request_id -> ReuseCache
