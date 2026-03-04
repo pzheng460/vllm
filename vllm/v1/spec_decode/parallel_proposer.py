@@ -72,6 +72,9 @@ class ParallelProposer:
         self.enable_concurrent = getattr(
             spec_config, "parallel_enable_concurrent", False,
         )
+        self.disable_targeted_branch = bool(
+            os.environ.get("VLLM_DISABLE_TARGETED_BRANCH", "")
+        )
         self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
         # Per-request reuse caches: request_id -> ReuseCache
@@ -1784,8 +1787,10 @@ class ParallelProposer:
         # Phase 2: For cache misses, generate targeted branches as fallback.
         # Targeted branches use the actual correction_token as root, so their
         # draft tokens are correct. This is cheaper than a full propose call.
+        # Can be disabled via VLLM_DISABLE_TARGETED_BRANCH to measure
+        # pure early-exit prediction quality.
         cache_misses = set(range(batch_size)) - set(cache_hits.keys())
-        if cache_misses:
+        if cache_misses and not self.disable_targeted_branch:
             try:
                 self._generate_targeted_branches(
                     target_token_ids, target_positions,
