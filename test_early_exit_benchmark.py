@@ -1,12 +1,14 @@
 """Benchmark: Parallel-SD with various early_exit_layer and top_k vs MTP baseline.
 
+Tracks throughput, cache hit rate, and acceptance length for comparison.
+
 Usage:
-    # Default: 8 built-in prompts
+    # Default: 8 built-in prompts, spec_tokens=1
     CUDA_VISIBLE_DEVICES=0,1,2,3 python test_early_exit_benchmark.py
 
-    # Use gpqa_diamond dataset (50 samples)
+    # Speculative tokens = 3, gpqa_diamond dataset
     CUDA_VISIBLE_DEVICES=0,1,2,3 python test_early_exit_benchmark.py \
-        --dataset gpqa_diamond --num-samples 50
+        --num-spec-tokens 3 --dataset gpqa_diamond --num-samples 50
 
     # Custom top-k and early-exit grid
     CUDA_VISIBLE_DEVICES=0,1,2,3 python test_early_exit_benchmark.py \
@@ -17,9 +19,15 @@ Usage:
         --extra-configs
 
 Configurations tested:
-  1. MTP baseline (num_speculative_tokens=1)
+  1. MTP baseline (same num_speculative_tokens)
   2. Parallel-SD grid: early_exit × top_k combinations
   3. (optional) half_cache_hit and concurrent variants
+
+Metrics compared:
+  - Throughput (tok/s) and speedup vs MTP baseline
+  - Mean acceptance length (includes bonus token) and ratio vs MTP
+  - Cache hit rate (Parallel-SD only)
+  - Output correctness vs MTP baseline
 """
 
 import argparse
@@ -35,6 +43,14 @@ import torch
 _CACHE_STATS_FILE = os.path.join(tempfile.gettempdir(),
                                   "vllm_cache_stats.json")
 os.environ["VLLM_CACHE_STATS_FILE"] = _CACHE_STATS_FILE
+
+# Spec decode acceptance stats file
+_SPEC_STATS_FILE = os.path.join(tempfile.gettempdir(),
+                                 "vllm_spec_stats.json")
+os.environ["VLLM_SPEC_STATS_FILE"] = _SPEC_STATS_FILE
+
+# Log stats frequently so acceptance metrics are flushed
+os.environ["VLLM_LOG_STATS_INTERVAL"] = "1"
 
 
 # ---------------------------------------------------------------------------
@@ -128,15 +144,34 @@ def cleanup_gpu():
         torch.cuda.synchronize()
 
 
+def _reset_spec_cumulative(llm):
+    """Reset cumulative spec decode stats in the logging pipeline."""
+    try:
+        mgr = llm.llm_engine.logger_manager
+        if mgr is None:
+            return
+        for sl in mgr.stat_loggers:
+            if hasattr(sl, 'per_engine_stat_loggers'):
+                for pesl in sl.per_engine_stat_loggers.values():
+                    if hasattr(pesl, 'spec_decoding_logging'):
+                        pesl.spec_decoding_logging.reset_cumulative()
+            elif hasattr(sl, 'spec_decoding_logging'):
+                sl.spec_decoding_logging.reset_cumulative()
+    except Exception:
+        pass
+
+
 def run_single_config(config_name, main_model, spec_config, prompts,
                       max_tokens=100, tp_size=4, max_model_len=4096,
                       gpu_mem=0.95, enforce_eager=True):
     """Run a single experiment configuration."""
     from vllm import LLM, SamplingParams
 
-    # Clean stale stats file before run
+    # Clean stale stats files before run
     if os.path.exists(_CACHE_STATS_FILE):
         os.remove(_CACHE_STATS_FILE)
+    if os.path.exists(_SPEC_STATS_FILE):
+        os.remove(_SPEC_STATS_FILE)
 
     print(f"\n{'='*60}")
     print(f"Running: {config_name}")
@@ -168,6 +203,16 @@ def run_single_config(config_name, main_model, spec_config, prompts,
     print("Warmup...")
     _ = llm.generate(prompts[:2], sampling_params)
 
+    # Clean stale spec stats from warmup — force flush then remove
+    try:
+        llm.llm_engine.do_log_stats()
+    except Exception:
+        pass
+    if os.path.exists(_SPEC_STATS_FILE):
+        os.remove(_SPEC_STATS_FILE)
+    # Reset cumulative acceptance counters so benchmark excludes warmup
+    _reset_spec_cumulative(llm)
+
     # Benchmark run
     print("Benchmark run...")
     start = time.time()
@@ -177,6 +222,12 @@ def run_single_config(config_name, main_model, spec_config, prompts,
     total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
     throughput = total_tokens / elapsed if elapsed > 0 else 0
 
+    # Force final stats flush so acceptance metrics are written
+    try:
+        llm.llm_engine.do_log_stats()
+    except Exception:
+        pass
+
     # Get cache stats from file (written by worker process)
     spec_metrics = {}
     if os.path.exists(_CACHE_STATS_FILE):
@@ -185,6 +236,16 @@ def run_single_config(config_name, main_model, spec_config, prompts,
                 cache_stats = json.load(f)
             spec_metrics["cache_stats"] = {"global": cache_stats}
             os.remove(_CACHE_STATS_FILE)  # clean for next config
+        except Exception:
+            pass
+
+    # Get spec decode acceptance stats from file
+    if os.path.exists(_SPEC_STATS_FILE):
+        try:
+            with open(_SPEC_STATS_FILE) as f:
+                acceptance_stats = json.load(f)
+            spec_metrics["acceptance"] = acceptance_stats
+            os.remove(_SPEC_STATS_FILE)  # clean for next config
         except Exception:
             pass
 
@@ -212,6 +273,17 @@ def run_single_config(config_name, main_model, spec_config, prompts,
     print(f"  Tokens: {total_tokens}")
     print(f"  Time: {elapsed:.3f}s")
     print(f"  Throughput: {throughput:.2f} tok/s")
+    if spec_metrics.get("acceptance"):
+        acc = spec_metrics["acceptance"]
+        mal = acc.get("mean_acceptance_length", 0)
+        dar = acc.get("draft_acceptance_rate", 0)
+        print(f"  Mean acceptance length: {mal:.2f}")
+        print(f"  Draft acceptance rate: {dar:.1f}%")
+        per_pos = acc.get("per_position_acceptance_rate", [])
+        if per_pos:
+            rates_str = ", ".join(f"{r:.3f}" for r in per_pos)
+            print(f"  Per-position acceptance: [{rates_str}]")
+
     if spec_metrics.get("cache_stats"):
         cs = spec_metrics["cache_stats"]
         if "global" in cs:
@@ -233,19 +305,34 @@ def run_single_config(config_name, main_model, spec_config, prompts,
 
 def print_summary(all_results):
     """Print benchmark summary table."""
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 90)
     print("BENCHMARK SUMMARY")
-    print("=" * 80)
+    print("=" * 90)
 
     baseline_tps = all_results[0]["tokens_per_sec"]
-    print(f"\n{'Config':<40} {'tok/s':>8} {'vs MTP':>10} {'Cache HIT':>12}")
-    print("-" * 75)
+    baseline_mal = all_results[0].get("spec_metrics", {}).get(
+        "acceptance", {}).get("mean_acceptance_length", 0)
+
+    print(f"\n{'Config':<35} {'tok/s':>8} {'vs MTP':>8}"
+          f" {'Acc Len':>8} {'vs MTP':>8} {'Cache HIT':>10}")
+    print("-" * 82)
     for r in all_results:
         name = r["config_name"]
         tps = r["tokens_per_sec"]
         speedup = tps / baseline_tps if baseline_tps > 0 else 0
         speedup_str = f"{speedup:.2f}x"
 
+        # Acceptance length
+        acc = r.get("spec_metrics", {}).get("acceptance", {})
+        mal = acc.get("mean_acceptance_length", 0)
+        mal_str = f"{mal:.2f}" if mal > 0 else "N/A"
+        if mal > 0 and baseline_mal > 0:
+            mal_ratio = mal / baseline_mal
+            mal_cmp = f"{mal_ratio:.2f}x"
+        else:
+            mal_cmp = "N/A"
+
+        # Cache hit
         cache_str = "N/A"
         cs = r.get("spec_metrics", {}).get("cache_stats", {})
         if "global" in cs:
@@ -254,7 +341,8 @@ def print_summary(all_results):
             if total > 0:
                 cache_str = f"{g['hit']/total*100:.1f}%"
 
-        print(f"  {name:<38} {tps:>8.1f} {speedup_str:>10} {cache_str:>12}")
+        print(f"  {name:<33} {tps:>8.1f} {speedup_str:>8}"
+              f" {mal_str:>8} {mal_cmp:>8} {cache_str:>10}")
 
     print()
 
