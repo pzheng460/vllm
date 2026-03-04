@@ -87,6 +87,7 @@ class ParallelProposer:
         self._total_propose_calls = 0
         self._total_cache_hits = 0
         self._early_exit_hidden_states: torch.Tensor | None = None
+        self._early_exit_residual: torch.Tensor | None = None
 
         # State for current propose call (set before propose, cleared after)
         self._sampled_token_ids: torch.Tensor | list | None = None
@@ -198,26 +199,37 @@ class ParallelProposer:
         return None
 
     def _apply_target_norm(
-        self, hidden_states: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the target model's final norm to hidden states.
 
-        Used for Eagle early-exit: intermediate layer hidden states are
-        pre-norm and need normalization before being fed to lm_head.
+        For models using fused_add_rms_norm (e.g. Pangu), the decoder layer
+        returns (hidden_states, residual) where hidden_states is the MLP
+        output.  The final norm must be: norm(hidden_states + residual).
+        RMSNorm with two arguments does fused_add_rms_norm internally.
 
         Args:
             hidden_states: Pre-norm hidden states from early exit layer.
+            residual: Residual tensor for fused_add_rms_norm, or None.
 
         Returns:
-            Normalized hidden states.
+            Normalized hidden states ready for compute_logits.
         """
         if self._target_norm is not None:
+            if residual is not None:
+                # fused_add_rms_norm: norm(hs + residual)
+                normed, _ = self._target_norm(hidden_states, residual)
+                return normed
             return self._target_norm(hidden_states)
         # Fallback: return as-is (may produce incorrect logits)
-        logger.warning(
+        logger.warning_once(
             "_apply_target_norm: no target norm found, "
             "returning un-normalized hidden states"
         )
+        if residual is not None:
+            return hidden_states + residual
         return hidden_states
 
     def _setup_early_exit_hook(self, target_model: nn.Module) -> None:
@@ -257,23 +269,34 @@ class ParallelProposer:
 
         def early_exit_hook(module, input, output):
             # Output from transformer layer is typically
-            # (hidden_states,) or hidden_states
+            # (hidden_states, residual) or hidden_states.
+            # Models using fused_add_rms_norm (e.g. Pangu) return
+            # (hidden_states, residual) where hidden_states is the MLP
+            # output and residual carries the accumulated representation.
+            # Both must be captured for correct norm application:
+            # final_hs = norm(hidden_states, residual) = rms_norm(hs + res)
             if isinstance(output, tuple):
                 hidden_states = output[0]
+                residual = output[1] if len(output) > 1 else None
             else:
                 hidden_states = output
+                residual = None
             # MUST clone! fused_add_rms_norm in the next layer modifies
             # hidden_states IN-PLACE. Without clone, the draft stream's
             # D2D copy races with the in-place modification.
             hs = hidden_states.detach().clone()
+            res = residual.detach().clone() if residual is not None else None
             self._early_exit_hidden_states = hs
+            self._early_exit_residual = res
 
             # Strategy B: Launch standard branch gen on draft stream
+            # Apply norm here to produce post-norm HS for the async path
             if (self._draft_stream is not None
                     and self._stored_batch_state is not None
                     and not self._standard_branches_launched):
+                normed_hs = self._apply_target_norm(hs, res)
                 self._launch_async_standard_branch_gen(
-                    hs, is_early_exit=True,
+                    normed_hs, is_early_exit=False,
                 )
 
         # Remove previous hook if exists
@@ -288,16 +311,23 @@ class ParallelProposer:
             layer_idx, num_layers,
         )
 
-    def get_early_exit_hidden_states(self) -> torch.Tensor | None:
-        """Get the hidden_states captured by the early exit hook.
+    def get_early_exit_hidden_states(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        """Get the hidden_states (and residual) captured by early exit hook.
 
         Returns:
-            Hidden states tensor if captured, None otherwise.
+            (hidden_states, residual) tuple if captured, None otherwise.
+            residual may be None for models that don't use fused_add_rms_norm.
             Consumes the captured states (one-time read).
         """
         hs = self._early_exit_hidden_states
+        if hs is None:
+            return None
+        res = self._early_exit_residual
         self._early_exit_hidden_states = None  # Consume
-        return hs
+        self._early_exit_residual = None
+        return hs, res
 
     # ------------------------------------------------------------------
     # Async branch generation (CUDA stream pipeline)
@@ -773,13 +803,13 @@ class ParallelProposer:
 
         with torch.no_grad():
             if is_early_exit:
-                if self._draft_method == "mtp":
-                    root_logits = self._underlying.model.compute_logits(
-                        selected_hs)
-                else:
-                    normed_hs = self._apply_target_norm(selected_hs)
-                    root_logits = self._target_model.compute_logits(
-                        normed_hs)
+                # Early exit HS are pre-norm: apply TARGET model's final
+                # norm before computing logits.  Using the target norm
+                # (not MTP SharedHead norm) is critical because the HS
+                # come from the target model's intermediate layers.
+                normed_hs = self._apply_target_norm(selected_hs)
+                root_logits = self._target_model.compute_logits(
+                    normed_hs)
             else:
                 root_logits = self._target_model.compute_logits(
                     selected_hs)
@@ -1347,16 +1377,17 @@ class ParallelProposer:
                 "for root tokens (avoids double normalization)"
             )
 
-        # For Eagle early-exit, we need the target model's final norm
-        # because Eagle's compute_logits does NOT apply norm internally
-        # (unlike MTP's SharedHead which has norm built in).
-        if self._draft_method in ("eagle", "eagle3"):
-            self._target_norm = self._find_target_norm(target_model)
-            if self._target_norm is not None:
-                logger.info(
-                    "ParallelProposer: found target model's final norm "
-                    "for Eagle early-exit normalization"
-                )
+        # For early-exit, we need the target model's final norm because
+        # early-exit hidden states are pre-norm (haven't gone through the
+        # model's final RMSNorm).  This is needed for both Eagle and MTP:
+        # the target norm must be used instead of MTP's SharedHead norm
+        # since the hidden states come from the target model's layers.
+        self._target_norm = self._find_target_norm(target_model)
+        if self._target_norm is not None:
+            logger.info(
+                "ParallelProposer: found target model's final norm "
+                "for early-exit normalization"
+            )
 
         # Load remote Eagle on separate GPU if configured
         if self._draft_device is not None:
@@ -1721,12 +1752,18 @@ class ParallelProposer:
         else:
             # No async branches — run full synchronous branch gen
             self._stored_batch_state = None
-            early_exit_hs = self.get_early_exit_hidden_states()
-            using_early_exit = early_exit_hs is not None
-            branch_hs = (
-                early_exit_hs if using_early_exit
-                else target_hidden_states
-            )
+            early_exit_result = self.get_early_exit_hidden_states()
+            using_early_exit = early_exit_result is not None
+            if using_early_exit:
+                early_exit_hs, early_exit_res = early_exit_result
+                # Apply the target model's final norm to early-exit HS
+                # immediately, producing post-norm HS equivalent to the
+                # target model's output.  This avoids threading the
+                # residual through branch generation methods.
+                branch_hs = self._apply_target_norm(
+                    early_exit_hs, early_exit_res)
+            else:
+                branch_hs = target_hidden_states
 
             try:
                 self._generate_branches(
@@ -1735,7 +1772,8 @@ class ParallelProposer:
                     next_token_ids, effective_lti, common_attn_metadata,
                     sampling_metadata, mm_embed_inputs,
                     num_rejected_tokens_gpu, batch_size,
-                    is_early_exit=using_early_exit,
+                    # Post-norm HS can use the same path as non-early-exit
+                    is_early_exit=False,
                 )
             except RuntimeError as e:
                 logger.debug("Branch generation skipped: %s", e)
@@ -1975,12 +2013,12 @@ class ParallelProposer:
 
         with torch.no_grad():
             if is_early_exit:
-                if self._draft_method == "mtp":
-                    logits = self._underlying.model.compute_logits(
-                        selected_hs)
-                else:
-                    normed_hs = self._apply_target_norm(selected_hs)
-                    logits = self._target_model.compute_logits(normed_hs)
+                # Early exit HS are pre-norm: apply TARGET model's final
+                # norm before computing logits.  Using the target norm
+                # (not MTP SharedHead norm) is critical because the HS
+                # come from the target model's intermediate layers.
+                normed_hs = self._apply_target_norm(selected_hs)
+                logits = self._target_model.compute_logits(normed_hs)
             else:
                 logits = self._target_model.compute_logits(selected_hs)
 
@@ -2329,7 +2367,7 @@ class ParallelProposer:
         if not branches:
             return
 
-        logger.warning(
+        logger.debug(
             "Targeted branch gen: %d branches (batch=%d)",
             len(branches), batch_size,
         )
@@ -2365,7 +2403,7 @@ class ParallelProposer:
 
         Args:
             branch_hidden_states: Hidden states for root token computation
-                (may be from early exit layer).
+                (may be from early exit layer, post-norm applied in caller).
             target_hidden_states: Last-layer hidden states for draft model
                 propose calls.
             is_early_exit: True if branch_hidden_states come from early
