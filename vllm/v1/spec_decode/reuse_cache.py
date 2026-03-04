@@ -124,7 +124,7 @@ class ReuseCache:
             return list(entry.continuation_tokens)
 
         # Half-cache-hit: prefix match (only when enabled)
-        if self.enable_half_cache_hit and len(key_tuple) > 1:
+        if self.enable_half_cache_hit:
             prefix = key_tuple[:-1]
             for cached_key, cached_entry in self._cache.items():
                 if len(cached_key) == len(key_tuple) and \

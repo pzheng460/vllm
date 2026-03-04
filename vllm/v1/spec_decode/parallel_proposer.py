@@ -1798,16 +1798,12 @@ class ParallelProposer:
         cache_misses = set(range(batch_size)) - set(cache_hits.keys())
         if cache_misses and not self.disable_targeted_branch:
             try:
-                self._generate_targeted_branches(
+                targeted_hits = self._generate_targeted_branches(
                     target_token_ids, target_positions,
                     target_hidden_states, next_token_ids,
                     effective_lti, common_attn_metadata,
                     sampling_metadata, mm_embed_inputs,
                     num_rejected_tokens_gpu, batch_size,
-                )
-                # Re-lookup to pick up targeted branch results
-                targeted_hits = self._cache_lookup_for_requests(
-                    cache_misses, batch_size,
                 )
                 cache_hits.update(targeted_hits)
             except RuntimeError as e:
@@ -1928,48 +1924,6 @@ class ParallelProposer:
             hit = cache.lookup(filtered)
             if hit is not None and len(hit) > 0:
                 cache_hits[i] = hit
-
-        return cache_hits
-
-    def _cache_lookup_for_requests(
-        self,
-        request_indices: set[int],
-        batch_size: int,
-    ) -> dict[int, list[int]]:
-        """Look up cache for specific request indices only.
-
-        Used after targeted branch generation to check if the targeted
-        branches resolved any cache misses. Does NOT update cache
-        hit/miss statistics (those were already counted in Phase 1).
-        """
-        cache_hits: dict[int, list[int]] = {}
-        if self._sampled_token_ids is None or self._request_ids is None:
-            return cache_hits
-
-        for i in request_indices:
-            if i >= len(self._request_ids) or i >= batch_size:
-                continue
-            req_id = self._request_ids[i]
-            cache = self._reuse_caches.get(req_id)
-            if cache is None:
-                continue
-
-            if isinstance(self._sampled_token_ids, torch.Tensor):
-                if self._sampled_token_ids.dim() == 1:
-                    tokens = [self._sampled_token_ids[i].item()]
-                else:
-                    tokens = self._sampled_token_ids[i].tolist()
-            else:
-                tokens = list(self._sampled_token_ids[i])
-
-            filtered = [t for t in tokens if t != -1]
-            if not filtered:
-                continue
-
-            # Direct cache access without updating statistics
-            entry = cache._cache.get(tuple(filtered))
-            if entry is not None:
-                cache_hits[i] = entry.continuation_tokens
 
         return cache_hits
 
@@ -2317,21 +2271,25 @@ class ParallelProposer:
         mm_embed_inputs: tuple | None,
         num_rejected_tokens_gpu: torch.Tensor | None,
         batch_size: int,
-    ) -> None:
+    ) -> dict[int, list[int]]:
         """Generate targeted branches (guaranteed cache hit).
 
-        For each request, adds a branch whose root_token = correction_token
-        at the matching position. Needs scoring results (next_token_ids
-        with correction token, sampled_token_ids for cache key).
+        For each request, generates a branch whose root_token =
+        correction_token at the matching position. Returns draft tokens
+        directly without storing in cache, avoiding the redundant
+        store-then-lookup round trip.
 
         Uses request_infos stored by _generate_standard_branches().
+
+        Returns:
+            dict mapping req_idx -> draft token list.
         """
         if self._sampled_token_ids is None or self._request_ids is None:
-            return
+            return {}
 
         request_infos = self._request_infos_proposer
         if not request_infos:
-            return
+            return {}
 
         branches: list[dict] = []
         for i in range(batch_size):
@@ -2376,7 +2334,7 @@ class ParallelProposer:
             })
 
         if not branches:
-            return
+            return {}
 
         logger.debug(
             "Targeted branch gen: %d branches (batch=%d)",
@@ -2384,12 +2342,14 @@ class ParallelProposer:
         )
 
         # Targeted branches are few (at most batch_size), use serial gen
-        self._serial_branch_generate(
+        # Return results directly instead of storing in cache
+        return self._serial_branch_generate(
             branches, target_token_ids, target_positions,
             target_hidden_states, next_token_ids,
             last_token_indices, common_attn_metadata,
             sampling_metadata, mm_embed_inputs,
             num_rejected_tokens_gpu, batch_size,
+            store_in_cache=False,
         )
 
     def _generate_branches(
@@ -2606,12 +2566,22 @@ class ParallelProposer:
         mm_embed_inputs: tuple | None,
         num_rejected_tokens_gpu: torch.Tensor | None,
         batch_size: int,
-    ) -> None:
+        store_in_cache: bool = True,
+    ) -> dict[int, list[int]]:
         """Fallback: generate branches via underlying propose calls.
 
         Groups non-conflicting branches (different req_idx) into
         single propose calls to reduce overhead.
+
+        Args:
+            store_in_cache: If True, store results in per-request caches.
+                If False, return results directly as {req_idx: draft_tokens}.
+
+        Returns:
+            dict mapping req_idx -> draft token list (always returned,
+            but primarily useful when store_in_cache=False).
         """
+        results: dict[int, list[int]] = {}
         # Save common_attn_metadata state.
         saved_seq_lens = common_attn_metadata.seq_lens.clone()
         saved_num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -2670,10 +2640,14 @@ class ParallelProposer:
             )
 
             for b in group:
-                req_id = self._request_ids[b["req_idx"]]
-                cache = self._get_or_create_cache(req_id)
                 draft_tokens = branch_result[b["req_idx"]].tolist()
-                cache.store_branch(b["cache_key"], draft_tokens)
+                if store_in_cache:
+                    req_id = self._request_ids[b["req_idx"]]
+                    cache = self._get_or_create_cache(req_id)
+                    cache.store_branch(b["cache_key"], draft_tokens)
+                results[b["req_idx"]] = draft_tokens
+
+        return results
 
     # ------------------------------------------------------------------
     # Batched branch generation (fast path)
