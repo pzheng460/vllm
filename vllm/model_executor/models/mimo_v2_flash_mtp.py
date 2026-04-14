@@ -101,7 +101,7 @@ class MiMoV2FlashMTPLayer(nn.Module):
         normed_embeds = self.enorm(inputs_embeds)
         normed_hidden = self.hnorm(previous_hidden_states)
         hidden_states = self.eh_proj(
-            torch.cat([normed_hidden, normed_embeds], dim=-1)
+            torch.cat([normed_embeds, normed_hidden], dim=-1)
         )
 
         # Decoder block
@@ -130,6 +130,19 @@ class MiMoV2FlashMTP(nn.Module):
         self.mtp_start_layer = config.num_hidden_layers
         num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
 
+        # MTP o_proj is bfloat16 in checkpoint; add to ignored_layers.
+        quant_config = vllm_config.quant_config
+        if quant_config is not None and hasattr(quant_config, "ignored_layers"):
+            if quant_config.ignored_layers is None:
+                quant_config.ignored_layers = []
+            for idx in range(
+                config.num_hidden_layers,
+                config.num_hidden_layers + num_mtp_layers,
+            ):
+                layer_prefix = f"{maybe_prefix(prefix, 'model')}.mtp_layers.{idx}"
+                quant_config.ignored_layers.append(
+                    f"{layer_prefix}.self_attn.o_proj")
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size,
         )
@@ -143,7 +156,7 @@ class MiMoV2FlashMTP(nn.Module):
                 config=config,
                 prefix=f"{maybe_prefix(prefix, 'model')}.mtp_layers.{idx}",
                 cache_config=vllm_config.cache_config,
-                quant_config=vllm_config.quant_config,
+                quant_config=quant_config,
             )
             for idx in range(
                 config.num_hidden_layers,
@@ -153,6 +166,11 @@ class MiMoV2FlashMTP(nn.Module):
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.num_mtp_layers = num_mtp_layers
+
+    @property
+    def model(self):
+        """Expose self as .model so eagle.py can do self.model.model.embed_tokens."""
+        return self
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -242,6 +260,13 @@ class MiMoV2FlashMTP(nn.Module):
             )
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Reset FP8 attention scales to 1.0 (MTP doesn't use FP8 KV cache)
+        for pn, pv in params_dict.items():
+            if pn.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                pv.data.fill_(1.0)
+                loaded_params.add(pn)
+
 
         return loaded_params
 

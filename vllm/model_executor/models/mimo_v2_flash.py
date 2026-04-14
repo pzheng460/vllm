@@ -434,6 +434,8 @@ class MiMoV2FlashDecoderLayer(nn.Module):
 class MiMoV2Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self._early_exit_layer: int = -1
+        self._early_exit_hidden_states: torch.Tensor | None = None
 
         config = vllm_config.model_config.hf_config.get_text_config()
         quant_config = vllm_config.quant_config
@@ -498,13 +500,18 @@ class MiMoV2Model(nn.Module):
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if (self._early_exit_layer >= 0
+                    and (self.start_layer + idx)
+                    == self._early_exit_layer):
+                self._early_exit_hidden_states = (
+                    hidden_states + residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = hidden_states + residual
 
         return hidden_states
 
@@ -703,10 +710,25 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         )
         return hidden_states
 
+    def set_early_exit_layer(self, layer: int):
+        num_layers = len(self.model.layers)
+        if layer < 0:
+            layer = num_layers + layer
+        if layer < 0 or layer >= num_layers:
+            self.model._early_exit_layer = -1
+        else:
+            self.model._early_exit_layer = layer
+
+    def get_early_exit_hidden_states(self) -> torch.Tensor | None:
+        hs = self.model._early_exit_hidden_states
+        self.model._early_exit_hidden_states = None
+        return hs
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        hidden_states = self.model.norm(hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
