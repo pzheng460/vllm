@@ -31,6 +31,7 @@ logger = init_logger(__name__)
 MTPModelTypes = Literal[
     "deepseek_mtp",
     "mimo_mtp",
+    "mimo_v2_flash_mtp",
     "glm4_moe_mtp",
     "ernie_mtp",
     "exaone_moe_mtp",
@@ -148,6 +149,23 @@ class SpeculativeConfig:
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
 
+    early_exit_layer: int = -1
+    """Early exit layer index for MTP speculative decoding. Hidden states
+    from this layer (instead of the final layer) are passed to MTP.
+    Negative values are relative to the last layer (-1 = last layer,
+    i.e., no early exit)."""
+    early_exit_embed: bool = False
+    """When True and early_exit_layer != -1, compute logits from the
+    early-exit hidden states at ALL positions and replace ALL input_ids
+    with the predicted tokens. This makes MTP's inputs_embeds derived
+    from early-exit hidden states rather than the original token ids."""
+    mtp_skip_norm: bool = False
+    """When True, skip the target model's final RMS norm before passing
+    hidden states to MTP. Passes raw hidden states directly."""
+    early_exit_topk: list[int] | None = None
+    """When set, enable early-exit top-k diagnostic that compares
+    early-exit logits against the target model's output. Specify k
+    values, e.g. [1, 3, 5]."""
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -195,6 +213,16 @@ class SpeculativeConfig:
                     "num_hidden_layers": 0,
                     "n_predict": n_predict,
                     "architectures": ["MiMoMTPModel"],
+                }
+            )
+
+        if hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
+            hf_config.model_type = "mimo_v2_flash_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "architectures": ["MiMoV2FlashMTPModel"],
                 }
             )
 

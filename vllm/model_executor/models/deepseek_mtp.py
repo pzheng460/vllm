@@ -158,6 +158,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
+        # logger.info("MTP forward: spec_step_idx=%d -> layer %d (of %d)",
+        #               spec_step_idx, current_step_idx, self.num_mtp_layers)
         return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,
             positions,
@@ -172,6 +174,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
+        # logger.info("MTP compute_logits: spec_step_idx=%d -> layer %d",
+        #               spec_step_idx, current_step_idx)
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = self.logits_processor(
             mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)

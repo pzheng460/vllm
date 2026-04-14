@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import json
+import os
+import tempfile
 from dataclasses import replace
 from importlib.util import find_spec
 
@@ -65,6 +68,27 @@ class EagleProposer:
         assert self.speculative_config is not None
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
+
+        # Early-exit support for MTP
+        self._early_exit_layer = self.speculative_config.early_exit_layer
+        self._early_exit_embed = self.speculative_config.early_exit_embed
+        self._target_norm = None
+        self._target_compute_logits = None
+
+        # Skip target norm before passing to MTP
+        self._mtp_skip_norm = self.speculative_config.mtp_skip_norm
+
+        # Early-exit top-k diagnostic
+        ee_topk = self.speculative_config.early_exit_topk
+        self._ee_topk_ks: list[int] = ee_topk if ee_topk else []
+        self._ee_topk_enabled = (
+            self._early_exit_layer != -1 and len(self._ee_topk_ks) > 0)
+        self._ee_topk_stats: dict[int, list[int]] = {
+            k: [0, 0] for k in self._ee_topk_ks}
+        self._ee_topk_call_count = 0
+        self._ee_topk_log_interval = 50
+        self._ee_topk_stats_file = os.path.join(
+            tempfile.gettempdir(), "vllm_ee_topk_stats.json")
 
         self.runner = runner
         self.device = device
@@ -313,6 +337,16 @@ class EagleProposer:
         self._set_positions(num_tokens, target_positions)
         self.hidden_states[:num_tokens] = target_hidden_states
 
+        # Early-exit embed: replace ALL input_ids with early-exit predictions.
+        if (self._early_exit_embed
+                and self._early_exit_layer != -1
+                and self._target_compute_logits is not None):
+            hs = target_hidden_states[:num_tokens]
+            if self._mtp_skip_norm and self._target_norm is not None:
+                hs = self._target_norm(hs)
+            ee_logits = self._target_compute_logits(hs)
+            self.input_ids[:num_tokens] = ee_logits.argmax(dim=-1).int()
+
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
 
@@ -348,6 +382,12 @@ class EagleProposer:
                 last_hidden_states, hidden_states = ret_hidden_states
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+
+        # Check EE top-k hit rates against target model's output
+        if self._ee_topk_enabled and self._target_compute_logits is not None:
+            self._check_ee_topk(
+                target_hidden_states, last_token_indices,
+                logits, next_token_ids)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
@@ -977,6 +1017,79 @@ class EagleProposer:
             model = model.module
         return model.__class__.__name__
 
+    def _find_target_norm(self, target_model: nn.Module):
+        """Find final norm in target model."""
+        norm_patterns = ["model.norm", "transformer.norm"]
+        for pattern in norm_patterns:
+            obj = target_model
+            for attr in pattern.split("."):
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        return None
+
+    @torch.no_grad()
+    def _check_ee_topk(
+        self,
+        target_hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        mtp_logits: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        """Check if target's sampled token is in early-exit layer's top-k.
+
+        Ground truth is next_token_ids — the target model's actual sampled
+        token at each last_token_indices position. EE logits are computed
+        from the normed early-exit hidden states via the target lm_head.
+        """
+        target_tokens = next_token_ids  # [batch_size]
+        hs = target_hidden_states[last_token_indices]
+        # Hidden states are always raw (un-normed); apply norm before
+        # target lm_head for logits computation.
+        if self._target_norm is not None:
+            hs = self._target_norm(hs)
+        ee_logits = self._target_compute_logits(hs)
+        if ee_logits is None:
+            return
+
+        batch_size = target_tokens.shape[0]
+        self._ee_topk_call_count += 1
+
+        max_k = max(self._ee_topk_ks)
+        ee_topk_ids = ee_logits.topk(max_k, dim=-1).indices
+
+        for k in self._ee_topk_ks:
+            hits = (ee_topk_ids[:, :k]
+                    == target_tokens.unsqueeze(-1)).any(dim=-1)
+            self._ee_topk_stats[k][0] += int(hits.sum().item())
+            self._ee_topk_stats[k][1] += batch_size
+
+        if self._ee_topk_call_count % self._ee_topk_log_interval == 0:
+            self._log_ee_topk_stats()
+
+    def _log_ee_topk_stats(self) -> None:
+        """Log and persist early-exit top-k hit rate stats."""
+        rates = ", ".join(
+            f"top-{k}: {s[0] / s[1] * 100:.1f}%"
+            for k, s in sorted(self._ee_topk_stats.items())
+            if s[1] > 0)
+        logger.info("EE top-k vs target [%d calls]: %s",
+                     self._ee_topk_call_count, rates)
+        try:
+            with open(self._ee_topk_stats_file, "w") as f:
+                json.dump({
+                    "ee_topk_calls": self._ee_topk_call_count,
+                    "ee_topk_hit_rates": {
+                        str(k): round(s[0] / s[1] * 100, 2)
+                        if s[1] > 0 else 0
+                        for k, s in sorted(self._ee_topk_stats.items())
+                    },
+                }, f)
+        except Exception:
+            pass
+
     def load_model(self, target_model: nn.Module) -> None:
         draft_model_config = self.vllm_config.speculative_config.draft_model_config
         target_attn_layer_names = set(
@@ -1157,6 +1270,24 @@ class EagleProposer:
             if hasattr(self.model, "lm_head"):
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
+
+        # Set up early-exit for MTP (model must implement
+        # set_early_exit_layer / get_early_exit_hidden_states).
+        need_early_exit = (self._early_exit_layer != -1
+                           or self._mtp_skip_norm)
+        if need_early_exit and self.method == "mtp":
+            if self._early_exit_layer != -1:
+                target_language_model.set_early_exit_layer(
+                    self._early_exit_layer)
+            self._target_norm = self._find_target_norm(
+                target_language_model)
+            self._target_compute_logits = (
+                target_language_model.compute_logits)
+            if self._early_exit_embed:
+                logger.info(
+                    "MTP early-exit embed enabled: "
+                    "ALL positions' inputs_embeds will use "
+                    "early-exit predicted tokens")
 
     @torch.inference_mode()
     def dummy_run(

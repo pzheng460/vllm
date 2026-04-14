@@ -395,6 +395,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "deepseek_mtp": DeepSeekMTPModelArchConfigConvertor,
     "qwen3_next_mtp": Qwen3NextMTPModelArchConfigConvertor,
     "mimo_mtp": MimoMTPModelArchConfigConvertor,
+    "mimo_v2_flash_mtp": MimoMTPModelArchConfigConvertor,
     "glm4_moe_mtp": GLM4MoeMTPModelArchConfigConvertor,
     "ernie_mtp": ErnieMTPModelArchConfigConvertor,
     "pangu_ultra_moe_mtp": PanguUltraMoeMTPModelArchConfigConvertor,

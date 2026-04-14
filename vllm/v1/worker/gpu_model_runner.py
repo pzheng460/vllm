@@ -3677,7 +3677,17 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
         elif spec_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            # MTP early-exit: replace hidden_states with intermediate
+            # layer output captured by the target model's forward.
+            if hasattr(self.model, 'get_early_exit_hidden_states'):
+                early_exit_hs = (
+                    self.model.get_early_exit_hidden_states())
+                if early_exit_hs is not None:
+                    if (not self.drafter._mtp_skip_norm
+                            and self.drafter._target_norm is not None):
+                        early_exit_hs = self.drafter._target_norm(
+                            early_exit_hs)
+                    hidden_states = early_exit_hs
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be

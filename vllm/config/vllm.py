@@ -770,6 +770,21 @@ class VllmConfig:
                 self.compilation_config.max_cudagraph_capture_size = 0
                 self.compilation_config.cudagraph_capture_sizes = []
             else:
+                # MTP early-exit captures intermediate hidden states
+                # during forward (via hooks or model attribute).
+                # FULL cudagraph replay skips Python side effects,
+                # so downgrade to PIECEWISE.
+                if (self.speculative_config is not None
+                        and getattr(self.speculative_config,
+                                    'early_exit_layer', -1) != -1
+                        and self.compilation_config.cudagraph_mode
+                        .has_full_cudagraphs()):
+                    logger.info(
+                        "MTP early-exit enabled: downgrading cudagraph_mode "
+                        "from %s to PIECEWISE to preserve forward hooks",
+                        self.compilation_config.cudagraph_mode.name)
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.PIECEWISE)
                 self.compilation_config.cudagraph_num_of_warmups = 1
 
             self._set_cudagraph_sizes()

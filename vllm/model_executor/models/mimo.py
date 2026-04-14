@@ -59,6 +59,12 @@ logger = init_logger(__name__)
     }
 )
 class MiMoModel(Qwen2Model):
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._early_exit_layer: int = -1
+        self._early_exit_hidden_states: torch.Tensor | None = None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -76,12 +82,21 @@ class MiMoModel(Qwen2Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for i, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
             )
+            if (self._early_exit_layer >= 0
+                    and (self.start_layer + i)
+                    == self._early_exit_layer):
+                # hidden_states + residual creates a new tensor,
+                # safe from in-place modification by subsequent layers.
+                self._early_exit_hidden_states = (
+                    hidden_states + residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
@@ -178,6 +193,34 @@ class MiMoForCausalLM(Qwen2ForCausalLM, nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+    def set_early_exit_layer(self, layer: int):
+        """Configure early exit at the specified layer index.
+
+        Negative values are relative to the last layer
+        (-1 = last layer, i.e. no early exit).
+        """
+        num_layers = len(self.model.layers)
+        if layer < 0:
+            layer = num_layers + layer
+        if layer < 0 or layer >= num_layers:
+            logger.warning(
+                "Early exit layer %d out of range [0, %d), disabling",
+                layer, num_layers)
+            self.model._early_exit_layer = -1
+            return
+        self.model._early_exit_layer = layer
+        logger.info(
+            "MTP early-exit configured on layer %d/%d", layer, num_layers)
+
+    def get_early_exit_hidden_states(self) -> torch.Tensor | None:
+        """Get and clear early-exit hidden states (one-time read).
+
+        Returns un-normed hidden states (residual already added).
+        """
+        hs = self.model._early_exit_hidden_states
+        self.model._early_exit_hidden_states = None
+        return hs
 
     def compute_logits(
         self,
