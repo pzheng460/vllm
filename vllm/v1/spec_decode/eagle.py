@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import json
+import os
+import tempfile
 from dataclasses import replace
 from importlib.util import find_spec
 
@@ -65,6 +68,35 @@ class EagleProposer:
         assert self.speculative_config is not None
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
+
+        # Early-exit support for MTP
+        self._early_exit_layer = self.speculative_config.early_exit_layer
+        self._early_exit_embed_all = (
+            self.speculative_config.early_exit_embed_all)
+        self._early_exit_hidden_states: torch.Tensor | None = None
+        self._early_exit_residual: torch.Tensor | None = None
+        self._early_exit_hook_handle = None
+        self._target_compute_logits = None
+        # Target's pre-replacement (last-layer) hidden states, saved during
+        # maybe_replace_hidden_states so the EE diagnostic can compute
+        # target argmax independent of the sampled token.
+        self._pre_replace_hidden_states: torch.Tensor | None = None
+        # Whether MTP model has multiple layers (num_mtp_layers > 1).
+        # When True, we bypass torch.compile to pass spec_step_idx.
+        self._mtp_multi_layer = False
+
+        # Early-exit top-k diagnostic
+        ee_topk = self.speculative_config.early_exit_topk
+        self._ee_topk_ks: list[int] = ee_topk if ee_topk else []
+        self._ee_topk_enabled = (
+            self._early_exit_layer != -1 and len(self._ee_topk_ks) > 0)
+        # Stats: {k: [hits, total]} for EE logits vs target output
+        self._ee_topk_stats: dict[int, list[int]] = {
+            k: [0, 0] for k in self._ee_topk_ks}
+        self._ee_topk_call_count = 0
+        self._ee_topk_log_interval = 50
+        self._ee_topk_stats_file = os.path.join(
+            tempfile.gettempdir(), "vllm_ee_topk_stats.json")
 
         self.runner = runner
         self.device = device
@@ -313,6 +345,15 @@ class EagleProposer:
         self._set_positions(num_tokens, target_positions)
         self.hidden_states[:num_tokens] = target_hidden_states
 
+        # Early-exit embed-all: replace input_ids with early-exit predictions.
+        if self._early_exit_embed_all and self._target_compute_logits is not None:
+            hs = target_hidden_states[:num_tokens]
+            # Chunk to avoid OOM from all_gather on full vocab.
+            for start in range(0, num_tokens, 256):
+                end = min(start + 256, num_tokens)
+                logits = self._target_compute_logits(hs[start:end])
+                self.input_ids[start:end] = logits.argmax(dim=-1).int()
+
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
 
@@ -335,19 +376,40 @@ class EagleProposer:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
         ):
-            ret_hidden_states = self.model(
-                input_ids=input_ids,
-                positions=self._get_positions(num_input_tokens),
-                hidden_states=self.hidden_states[:num_input_tokens],
-                inputs_embeds=inputs_embeds,
-            )
+            # For MTP with num_mtp_layers > 1, call .forward() directly
+            # to bypass torch.compile which bakes spec_step_idx=0 as a
+            # constant (vllm drops all guards via guard_filter_fn).
+            if self._mtp_multi_layer:
+                ret_hidden_states = self.model.forward(
+                    input_ids=input_ids,
+                    positions=self._get_positions(num_input_tokens),
+                    hidden_states=self.hidden_states[:num_input_tokens],
+                    inputs_embeds=inputs_embeds,
+                    spec_step_idx=0,
+                )
+            else:
+                ret_hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=self._get_positions(num_input_tokens),
+                    hidden_states=self.hidden_states[:num_input_tokens],
+                    inputs_embeds=inputs_embeds,
+                )
             if self.method == "mtp":
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
         sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
+        if self._mtp_multi_layer:
+            logits = self.model.compute_logits(sample_hidden_states,
+                                               spec_step_idx=0)
+        else:
+            logits = self.model.compute_logits(sample_hidden_states)
+
+        # Check EE/MTP top-k hit rates against target model's output
+        if self._ee_topk_enabled and self._target_compute_logits is not None:
+            self._check_ee_topk(
+                target_hidden_states, last_token_indices, next_token_ids)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
@@ -526,19 +588,33 @@ class EagleProposer:
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
             ):
-                ret_hidden_states = self.model(
-                    input_ids=input_ids,
-                    positions=self._get_positions(input_batch_size),
-                    hidden_states=self.hidden_states[:input_batch_size],
-                    inputs_embeds=inputs_embeds,
-                )
+                if self._mtp_multi_layer:
+                    ret_hidden_states = self.model.forward(
+                        input_ids=input_ids,
+                        positions=self._get_positions(input_batch_size),
+                        hidden_states=self.hidden_states[:input_batch_size],
+                        inputs_embeds=inputs_embeds,
+                        spec_step_idx=token_index + 1,
+                    )
+                else:
+                    ret_hidden_states = self.model(
+                        input_ids=input_ids,
+                        positions=self._get_positions(input_batch_size),
+                        hidden_states=self.hidden_states[:input_batch_size],
+                        inputs_embeds=inputs_embeds,
+                    )
                 if self.method == "mtp":
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
             hidden_states = hidden_states[:batch_size]
-            logits = self.model.compute_logits(last_hidden_states[:batch_size])
+            if self._mtp_multi_layer:
+                logits = self.model.compute_logits(
+                    last_hidden_states[:batch_size],
+                    spec_step_idx=token_index + 1)
+            else:
+                logits = self.model.compute_logits(last_hidden_states[:batch_size])
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
 
@@ -977,6 +1053,164 @@ class EagleProposer:
             model = model.module
         return model.__class__.__name__
 
+    @staticmethod
+    def _resolve_attr(model: nn.Module, patterns: list[str]):
+        """Resolve a dotted attribute path on a model.
+
+        Tries each pattern in order and returns the first match, or None.
+        """
+        for pattern in patterns:
+            obj = model
+            for attr in pattern.split("."):
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        return None
+
+    def _find_target_layers(self, target_model: nn.Module):
+        """Find transformer layers in target model."""
+        return self._resolve_attr(target_model, [
+            "model.layers", "model.model.layers",
+            "transformer.layers", "encoder.layers",
+        ])
+
+    def _setup_early_exit_hook(self, target_model: nn.Module) -> bool:
+        """Set up a forward hook on an intermediate target layer so MTP
+        receives pre-norm hidden states from that layer instead of the
+        final layer.
+        """
+        if self._early_exit_layer == -1:
+            return False
+
+        target_layers = self._find_target_layers(target_model)
+        if target_layers is None:
+            logger.warning("Cannot find target model layers for early-exit")
+            return False
+
+        num_layers = len(target_layers)
+        if self._early_exit_layer < 0:
+            layer_idx = num_layers + self._early_exit_layer
+        else:
+            layer_idx = self._early_exit_layer
+
+        if layer_idx < 0 or layer_idx >= num_layers:
+            logger.warning(
+                "Early exit layer %d out of range [0, %d), disabling",
+                self._early_exit_layer, num_layers)
+            return False
+
+        layer = target_layers[layer_idx]
+
+        def hook_fn(module, input, output):
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+                residual = output[1] if len(output) > 1 else None
+            else:
+                hidden_states = output
+                residual = None
+            self._early_exit_hidden_states = hidden_states.clone()
+            self._early_exit_residual = (
+                residual.clone() if residual is not None else None)
+
+        self._early_exit_hook_handle = layer.register_forward_hook(hook_fn)
+        logger.info(
+            "Early-exit hook registered on layer %d/%d",
+            layer_idx, num_layers)
+        return True
+
+    def maybe_replace_hidden_states(
+        self, hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace hidden states with the captured early-exit layer output.
+
+        Consumes the captured hook output (one-shot).  Returns the input
+        unchanged when early-exit is not active.  MTP consumes pre-norm
+        hidden states, so no RMSNorm is applied here.
+        """
+        if self._early_exit_hidden_states is None:
+            return hidden_states
+
+        hs = self._early_exit_hidden_states
+        residual = self._early_exit_residual
+        self._early_exit_hidden_states = None
+        self._early_exit_residual = None
+
+        if residual is not None:
+            hs = hs + residual
+        # Save target's last-layer hidden states (pre-replacement) so the
+        # EE diagnostic can compare EE argmax against target argmax
+        # independent of the sampling temperature.  Clone to snapshot the
+        # tensor and detach from the autograd-free forward path.
+        if self._ee_topk_enabled:
+            self._pre_replace_hidden_states = hidden_states.clone()
+        return hs
+
+    @torch.no_grad()
+    def _check_ee_topk(
+        self,
+        target_hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        """Top-k hit rate of EE predictions vs target last-layer predictions.
+
+        Ground truth is the argmax of the target's *own* last-layer logits
+        (sampling-independent).  Falls back to the sampled next_token_ids
+        when the pre-replacement hidden states weren't captured.
+        """
+        ee_hs = target_hidden_states[last_token_indices]
+        # target.compute_logits applies the deferred RMSNorm before lm_head.
+        ee_logits = self._target_compute_logits(ee_hs)
+        if ee_logits is None:
+            return
+
+        if self._pre_replace_hidden_states is not None:
+            target_hs = self._pre_replace_hidden_states[last_token_indices]
+            target_logits = self._target_compute_logits(target_hs)
+            target_tokens = target_logits.argmax(dim=-1)
+            self._pre_replace_hidden_states = None
+        else:
+            target_tokens = next_token_ids
+
+        batch_size = target_tokens.shape[0]
+        self._ee_topk_call_count += 1
+
+        max_k = max(self._ee_topk_ks)
+        ee_topk_ids = ee_logits.topk(max_k, dim=-1).indices
+
+        for k in self._ee_topk_ks:
+            hits = (ee_topk_ids[:, :k]
+                    == target_tokens.unsqueeze(-1)).any(dim=-1)
+            self._ee_topk_stats[k][0] += int(hits.sum().item())
+            self._ee_topk_stats[k][1] += batch_size
+
+        if self._ee_topk_call_count % self._ee_topk_log_interval == 0:
+            self._log_ee_topk_stats()
+
+    def _log_ee_topk_stats(self) -> None:
+        """Log and persist early-exit top-k hit rate stats."""
+        rates = ", ".join(
+            f"top-{k}: {s[0] / s[1] * 100:.1f}%"
+            for k, s in sorted(self._ee_topk_stats.items())
+            if s[1] > 0)
+        logger.info(
+            "EE top-k vs target last-layer argmax [%d calls]: %s",
+            self._ee_topk_call_count, rates)
+        try:
+            with open(self._ee_topk_stats_file, "w") as f:
+                json.dump({
+                    "ee_topk_calls": self._ee_topk_call_count,
+                    "ee_topk_hit_rates": {
+                        str(k): round(s[0] / s[1] * 100, 2)
+                        if s[1] > 0 else 0
+                        for k, s in sorted(self._ee_topk_stats.items())
+                    },
+                }, f)
+        except Exception:
+            pass
+
     def load_model(self, target_model: nn.Module) -> None:
         draft_model_config = self.vllm_config.speculative_config.draft_model_config
         target_attn_layer_names = set(
@@ -995,6 +1229,16 @@ class EagleProposer:
             self.model = get_model(
                 vllm_config=self.vllm_config, model_config=draft_model_config
             )
+
+        # Detect multi-layer MTP: bypass torch.compile to pass spec_step_idx
+        inner = getattr(self.model, 'model', None)
+        num_mtp = getattr(inner, 'num_mtp_layers', 1)
+        if num_mtp > 1:
+            self._mtp_multi_layer = True
+            logger.info(
+                "MTP model has %d layers: bypassing torch.compile "
+                "to pass spec_step_idx for per-step layer selection.",
+                num_mtp)
 
         draft_attn_layer_names = (
             get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
@@ -1157,6 +1401,17 @@ class EagleProposer:
             if hasattr(self.model, "lm_head"):
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
+
+        # Set up early-exit hook when requested.
+        if self._early_exit_layer != -1:
+            self._setup_early_exit_hook(target_language_model)
+            self._target_compute_logits = (
+                target_language_model.compute_logits)
+            if self._early_exit_embed_all:
+                logger.info(
+                    "Early-exit embed-all mode enabled: "
+                    "ALL positions' inputs_embeds will use "
+                    "early-exit predicted tokens")
 
     @torch.inference_mode()
     def dummy_run(

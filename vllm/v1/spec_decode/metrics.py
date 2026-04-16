@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json as _json
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -53,6 +55,11 @@ class SpecDecodingLogging:
     """
 
     def __init__(self):
+        # Cumulative counters (never reset, for file-based export)
+        self._cumulative_drafts = 0
+        self._cumulative_draft_tokens = 0
+        self._cumulative_accepted_tokens = 0
+        self._cumulative_accepted_per_pos: list[int] = []
         self.reset()
 
     def reset(self):
@@ -61,6 +68,13 @@ class SpecDecodingLogging:
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
         self.last_log_time = time.monotonic()
+
+    def reset_cumulative(self):
+        """Reset cumulative counters (e.g. after warmup)."""
+        self._cumulative_drafts = 0
+        self._cumulative_draft_tokens = 0
+        self._cumulative_accepted_tokens = 0
+        self._cumulative_accepted_per_pos = []
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
         self.num_drafts.append(spec_decoding_stats.num_drafts)
@@ -114,6 +128,44 @@ class SpecDecodingLogging:
             rates_str,
             draft_acceptance_rate,
         )
+
+        # Accumulate cumulative stats
+        self._cumulative_drafts += int(num_drafts)
+        self._cumulative_draft_tokens += int(num_draft_tokens)
+        self._cumulative_accepted_tokens += int(num_accepted_tokens)
+        pos_sums = np.sum(pos_matrix, axis=0).astype(int).tolist()
+        if not self._cumulative_accepted_per_pos:
+            self._cumulative_accepted_per_pos = pos_sums
+        else:
+            for i in range(min(len(self._cumulative_accepted_per_pos),
+                               len(pos_sums))):
+                self._cumulative_accepted_per_pos[i] += pos_sums[i]
+
+        # Write cumulative stats to file if env var is set
+        stats_file = os.environ.get("VLLM_SPEC_STATS_FILE")
+        if stats_file:
+            cd = self._cumulative_drafts
+            ca = self._cumulative_accepted_tokens
+            cdt = self._cumulative_draft_tokens
+            cum_mal = 1 + (ca / cd) if cd > 0 else 0
+            cum_dar = (ca / cdt * 100) if cdt > 0 else 0
+            cum_rates = ([p / cd for p in self._cumulative_accepted_per_pos]
+                         if cd > 0 else [])
+            try:
+                with open(stats_file, "w") as f:
+                    _json.dump({
+                        "num_drafts": cd,
+                        "num_draft_tokens": cdt,
+                        "num_accepted_tokens": ca,
+                        "mean_acceptance_length": round(cum_mal, 4),
+                        "draft_acceptance_rate": round(cum_dar, 2),
+                        "per_position_acceptance_rate": [
+                            round(r, 4) for r in cum_rates
+                        ],
+                    }, f)
+            except Exception:
+                pass
+
         self.reset()
 
 

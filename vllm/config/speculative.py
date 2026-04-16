@@ -148,6 +148,21 @@ class SpeculativeConfig:
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
 
+    early_exit_layer: int = -1
+    """Early exit layer index for MTP speculative decoding. Hidden states
+    from this layer (instead of the final layer) are passed to MTP.
+    Negative values are relative to the last layer (-1 = last layer,
+    i.e., no early exit). Works with method='eagle' when using MTP."""
+    early_exit_embed_all: bool = False
+    """When True and early_exit_layer != -1, compute logits from the
+    early-exit hidden states at ALL positions and replace ALL input_ids
+    with the predicted tokens (not just the last position). This tests
+    whether using early-exit predictions at every position helps or
+    hurts draft quality. Only affects the first MTP forward pass."""
+    early_exit_topk: list[int] | None = None
+    """When set, enable early-exit top-k diagnostic that compares
+    early-exit logits against the target model's output. Specify k
+    values, e.g. [1, 3, 5]."""
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

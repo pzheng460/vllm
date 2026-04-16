@@ -3677,7 +3677,10 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
         elif spec_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            # Early-exit: replace hidden_states with intermediate layer
+            # output if an early-exit hook captured it.
+            hidden_states = self.drafter.maybe_replace_hidden_states(
+                hidden_states)
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be

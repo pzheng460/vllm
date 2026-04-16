@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+from copy import copy
 
 import torch
 
@@ -74,6 +75,28 @@ def create_static_sink_attention_backend(
                 device=device,
                 dtype=torch.int32,
             )
+            # Separate buffer for build_for_drafting to avoid corrupting
+            # main model's FlashAttentionMetadata during drafting.
+            # Needs 2*num_sink_blocks extra columns because
+            # build_for_drafting() uses seq_lens = L+2S (double sink
+            # adjustment) which accesses up to column
+            # cdiv(max_model_len + 2*sink_len, block_size).
+            self.block_table_with_sink_draft = torch.zeros(
+                (
+                    scheduler_config.max_num_seqs,
+                    self.max_num_blocks + 2 * self.num_sink_blocks,
+                ),
+                device=device,
+                dtype=torch.int32,
+            )
+            self.block_table_with_sink_draft[
+                :, : self.num_sink_blocks
+            ] = torch.arange(
+                1,
+                self.num_sink_blocks + 1,
+                device=device,
+                dtype=torch.int32,
+            )
 
         def build(
             self,
@@ -92,14 +115,60 @@ def create_static_sink_attention_backend(
             )
             max_num_blocks = cdiv(common_attn_metadata.max_seq_len, self.block_size)
             num_reqs = common_attn_metadata.num_reqs
+            # Clamp copy size: after adding sink_len, max_num_blocks can
+            # exceed the source block table's columns near max_model_len.
+            src_num_blocks = common_attn_metadata.block_table_tensor.shape[1]
+            copy_blocks = min(max_num_blocks, src_num_blocks)
             self.block_table_with_sink[
-                :num_reqs, self.num_sink_blocks : self.num_sink_blocks + max_num_blocks
-            ] = common_attn_metadata.block_table_tensor[:, :max_num_blocks]
+                :num_reqs, self.num_sink_blocks : self.num_sink_blocks + copy_blocks
+            ] = common_attn_metadata.block_table_tensor[:, :copy_blocks]
             common_attn_metadata.block_table_tensor = self.block_table_with_sink[
                 :num_reqs
             ]
 
             return super().build(common_prefix_len, common_attn_metadata, fast_build)
+
+        def build_for_drafting(
+            self,
+            common_attn_metadata: CommonAttentionMetadata,
+            draft_index: int,
+        ) -> AttentionMetadata:
+            # Uses copies instead of in-place modification.
+            # After main model's build(), seq_lens is L+S. Adding another S
+            # gives L+2S for the drafter. Separate block_table buffer and
+            # new seq_lens tensor avoid corrupting the main model's state.
+            draft_cm = copy(common_attn_metadata)
+
+            sink_seq_lens = common_attn_metadata.seq_lens + self.sink_len
+            sink_seq_lens[sink_seq_lens == self.sink_len] = 0
+            draft_cm.seq_lens = sink_seq_lens
+
+            draft_cm.max_seq_len = (
+                common_attn_metadata.max_seq_len + self.sink_len
+            )
+
+            max_num_blocks = cdiv(draft_cm.max_seq_len, self.block_size)
+            num_reqs = draft_cm.num_reqs
+
+            # Clamp copy size: with L+2S, max_num_blocks can exceed the
+            # source block table's columns near max_model_len.
+            src_num_blocks = common_attn_metadata.block_table_tensor.shape[1]
+            copy_blocks = min(max_num_blocks, src_num_blocks)
+            self.block_table_with_sink_draft[
+                :num_reqs,
+                self.num_sink_blocks : self.num_sink_blocks + copy_blocks,
+            ] = common_attn_metadata.block_table_tensor[:num_reqs, :copy_blocks]
+            draft_cm.block_table_tensor = self.block_table_with_sink_draft[
+                :num_reqs
+            ]
+
+            # Call underlying builder's build() directly (skip our build()
+            # which does in-place modification).
+            return super().build(
+                common_prefix_len=0,
+                common_attn_metadata=draft_cm,
+                fast_build=True,
+            )
 
     attn_backend = subclass_attention_backend(
         name_prefix=prefix,
